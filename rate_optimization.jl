@@ -15,6 +15,7 @@ using Jutul, JutulDarcy, GLMakie, GeoEnergyIO, HYPRE, LBFGSB
 data_dir = GeoEnergyIO.test_input_file_path("EGG")
 data_pth = joinpath(data_dir, "EGG.DATA")
 fine_case = setup_case_from_data_file(data_pth)
+coarse_case = fine_case
 fine_case = fine_case[1:50];
 coarse_case = coarsen_reservoir_case(fine_case, (20, 20, 3), method = :ijk);
 # ## Set up the rate optimization
@@ -55,6 +56,7 @@ function optimize_rates(steps; use_box_bfgs = true)
         ),
         steps = steps
     )
+
     if use_box_bfgs
         obj_best, x_best, hist = Jutul.unit_box_bfgs(setup.x0, setup.obj,
             maximize = true,
@@ -89,6 +91,7 @@ fig = Figure()
 ax = Axis(fig[1, 1], xlabel = "Injector number", ylabel = "Rate fraction (of max injection rate)")
 barplot!(ax, x1)
 ax.xticks = eachindex(x1)
+x1
 fig
 # ### Optimize with varying rates per time-step
 case2, hist2, x2 = optimize_rates(:each);
