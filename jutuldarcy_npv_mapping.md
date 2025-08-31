@@ -7,11 +7,11 @@
 
 ## 0) Чёткие исходные данные для численного примера
 
-- Кол-во инжекторов: $n_{\text{inj}} = 3$.
-- Базовый таргет на одну скважину: `base_rate = 100` м³/сут.
-- Умножитель потолка: `max_rate_factor = 10`  $\Rightarrow Q_{\max} = 100 \cdot 10 = 1000$ м³/сут.
+- Кол-во инжекторов: $n_{\text{inj}} = 8$.
+- Базовый таргет на одну скважину: `base_rate = 79.5` м³/сут.
+- Умножитель потолка: `max_rate_factor = 10`  $\Rightarrow Q_{\max} = 79.5 \cdot 10 = 795$ м³/сут.
 - Минимальный дебит одной скважины: `MIN_INITIAL_WELL_RATE = 1` м³/сут.
-- Два отчётных шага одинаковой длины: $\Delta t_1 = \Delta t_2 = 30$ суток.
+- 50 отчётных шага одинаковой длины: $\Delta t_1 = \Delta t_2 = ?$ суток. 
 - Дисконт: `discount_rate = 0.05` (5%/год), дисконт-единица — *год*.
 - Цены/затраты: `oil_price = 100`, `water_price = -10`, `water_cost = 5` (условные \$/м³).
 
@@ -145,13 +145,7 @@
 
 ### Математика (вклад одного шага)
 
-$
-J_i(\alpha)=\Big(
-p_o \underbrace{\sum_{w\in\mathcal P} q_o^{(w)}(i;\alpha)}_{\text{нефть}}
-+ p_g \underbrace{\sum_{w\in\mathcal P} q_g^{(w)}(i;\alpha)}_{\text{газ}}
-+ p_w \underbrace{\sum_{w\in\mathcal P} q_w^{(w)}(i;\alpha)}_{\text{вода на выкиде}}
-\;-\;
-c_w \underbrace{\sum_{w\in\mathcal I} q_{\text{inj}}^{(w)}(i;\alpha)}_{\text{закачка воды}}
+$J_i(\alpha)=\Big(p_o \underbrace{\sum_{w\in\mathcal P} q_o^{(w)}(i;\alpha)}_{\text{нефть}}+ p_g \underbrace{\sum_{w\in\mathcal P} q_g^{(w)}(i;\alpha)}_{\text{газ}}+ p_w \underbrace{\sum_{w\in\mathcal P} q_w^{(w)}(i;\alpha)}_{\text{вода на выкиде}}\;-\;c_w \underbrace{\sum_{w\in\mathcal I} q_{\text{inj}}^{(w)}(i;\alpha)}_{\text{закачка воды}}
 \Big)\cdot \Delta t_i \cdot (1+r)^{-t_i}.
 $
 
@@ -303,5 +297,3 @@ $
 Adjoint возвращает $\partial \mathrm{NPV}/\partial(\text{target\_rate})$, далее умножаем на $Q_{\max}$ — получаем $\partial \mathrm{NPV}/\partial \alpha$.
 
 ---
-
-*Конец файла.*
