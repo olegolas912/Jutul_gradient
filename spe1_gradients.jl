@@ -7,6 +7,12 @@ using Jutul, JutulDarcy, GeoEnergyIO, GLMakie
 data_pth = joinpath(GeoEnergyIO.test_input_file_path("SPE1"), "SPE1.DATA")
 data = parse_data_file(data_pth);
 case = setup_case_from_data_file(data);
+
+data_dir = GeoEnergyIO.test_input_file_path("EGG")
+data_pth = joinpath(data_dir, "EGG.DATA")
+data = parse_data_file(data_pth);
+case = setup_case_from_data_file(data_pth)
+
 # ## Set up a function to set up the case with custom porosity
 # We create a setup function that takes in a parameter dictionary `prm` and
 # returns a case with the porosity set to the value in `prm["poro"]`. This is a

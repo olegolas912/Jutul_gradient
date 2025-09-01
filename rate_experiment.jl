@@ -1,96 +1,311 @@
-# min_npv3.jl — три кейса, сравнение их NPV и бар-график (GLMakie)
+# ==========================================
+# Producer-rate optimization on EGG example
+# (control = production well rates instead of injectors)
+# ==========================================
+using Jutul, JutulDarcy, GLMakie, GeoEnergyIO, HYPRE, LBFGSB
 
-using Jutul, JutulDarcy, GeoEnergyIO, GLMakie
+# Optional: use local helper/objectives (QoI + NPV) if you have them as files
+# Include only if needed in your project layout:
+# include("utils.jl")        # for reservoir_measurables, etc., if not from package
+# include("objectives.jl")   # for compute_well_qoi, npv_objective
 
-# --- 1) База: EGG → 50 шагов → укрупнение 20×20×3
+# ---------- Load and coarsen EGG case (same as original example) ----------
 data_dir = GeoEnergyIO.test_input_file_path("EGG")
-case_fine = setup_case_from_data_file(joinpath(data_dir, "EGG.DATA"))
-case_fine = case_fine[1:50]
-base_case = coarsen_reservoir_case(case_fine, (20, 20, 3), method = :ijk)
+data_pth = joinpath(data_dir, "EGG.DATA")
+fine_case   = setup_case_from_data_file(data_pth)
+coarse_case = coarsen_reservoir_case(fine_case[1:50], (20, 20, 3), method = :ijk)
 
-# --- 2) Параметры экономики
-const OIL_PRICE   = 100.0     # $/stb
-const WATER_PRICE = -10.0     # $/stb (штраф за добытую воду)
-const WATER_COST  =  5.0      # $/stb (стоимость закачки воды)
-const DISC        =  0.05     # 5% годовых
+# ---------- Helpers ----------
+const EPS_RATE = 1e-12
 
-ctrl = base_case.forces[1][:Facility].control
-base_rate = ctrl[:INJECT1].target.value
+function get_well_lists(case::JutulCase)
+    f1 = case.forces[1][:Facility]
+    wells = collect(keys(f1.control))
+    injectors = Symbol[]
+    producers = Symbol[]
+    for w in wells
+        c = f1.control[w]
+        if c isa InjectorControl
+            push!(injectors, w)
+        elseif c isa ProducerControl
+            push!(producers, w)
+        end
+    end
+    return injectors, producers
+end
 
-function optimize_case(case, steps)
-    setup = JutulDarcy.setup_rate_optimization_objective(case, base_rate;
+function liquid_rate_of_well(model, state, forces, w::Symbol)
+    # Prefer SurfaceLiquidRateTarget; fall back to oil+water if needed
+    try
+        return abs(compute_well_qoi(model, state, forces, w, SurfaceLiquidRateTarget))
+    catch
+        lr = 0.0
+        try
+            lr += abs(compute_well_qoi(model, state, forces, w, SurfaceOilRateTarget))
+        catch
+        end
+        try
+            lr += abs(compute_well_qoi(model, state, forces, w, SurfaceWaterRateTarget))
+        catch
+        end
+        return lr
+    end
+end
+
+function base_rate_from_producers(case::JutulCase; default_if_zero=convert_to_si(100.0, :stb)/si_unit(:day))
+    ws, states = simulate_reservoir(case, info_level = -1)
+    model = case.model
+    forces1 = case.forces[1]
+    _, producers = get_well_lists(case)
+    if isempty(producers)
+        error("В кейсе не найдены добывающие скважины.")
+    end
+    # возьмем средний дебит по продюсерам на первом репорт-шаге
+    s1 = states[1]
+    vals = [liquid_rate_of_well(model, s1, forces1, w) for w in producers]
+    br = mean(vals)
+    return br > EPS_RATE ? br : default_if_zero
+end
+
+# ---------- Objective builder: control PRODUCER rates ----------
+"""
+    setup_producer_rate_optimization_objective(case, base_rate; kwargs...)
+
+Похоже на setup_rate_optimization_objective из примера, но:
+- список управляемых скважин = добывающие (ProducerControl),
+- целевая функция NPV учитывает выручку продюсеров и (как обычно) стоимость закачки инжекторов,
+- градиент считается по целевым квотам продюсеров (TotalRateTarget).
+"""
+function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
         max_rate_factor = 10.0,
-        oil_price = OIL_PRICE,
-        water_price = WATER_PRICE,
-        water_cost = WATER_COST,
-        discount_rate = DISC,
-        maximize = true,
-        sim_arg = (rtol = 1e-5, tol_cnv = 1e-5),
-        steps = steps              # :first — одна доля на весь период, :each — новая на каждый отчётный шаг
+        steps = :first,                  # :first = один набор, :each = на каждый репорт-шаг
+        use_ministeps = true,
+        limits_enabled = true,
+        verbose = true,
+        # NPV economics (per barrel / per Mscf)
+        oil_price   = 100.0,
+        gas_price   = 0.0,
+        water_price = -10.0,
+        water_cost  = 5.0,
+        oil_cost    = 0.0,
+        gas_cost    = 0.0,
+        discount_rate = 0.05,
+        sim_arg = NamedTuple(),
+        kwarg...
     )
-    obj_best, x_best, hist = Jutul.unit_box_bfgs(setup.x0, setup.obj; maximize = true, lin_eq = setup.lin_eq)
-    final_obj = hist.val[end]      # NPV оптимизатора на последней итерации (для справки)
-    return setup.case, final_obj
+    steps in (:first, :each) || error("steps must be :first or :each")
+
+    function myprint(s) verbose && println(s) end
+
+    # Copy forces per step to freely modify controls during optimization
+    nstep = length(case.dt)
+    forces = case.forces isa Vector ? [deepcopy(f) for f in case.forces] : [deepcopy(case.forces) for _ in 1:nstep]
+    case   = JutulCase(case.model, case.dt, forces; state0=case.state0, parameters=case.parameters)
+
+    # Detect wells by control type
+    injectors, producers = get_well_lists(case)
+    isempty(producers)  && error("Не найдены добывающие скважины.")
+    isempty(injectors)  && myprint("Внимание: инжекторов нет — затраты на закачку будут нулевыми.")
+
+    # Controlled wells are PRODUCERS
+    control_wells = producers
+    n_ctrl = length(control_wells)
+    myprint("Управляемые скважины (добывающие): $control_wells; всего = $n_ctrl")
+
+    eachstep = steps == :each
+    nstep_unique = eachstep ? nstep : 1
+    max_rate = max_rate_factor*base_rate
+
+    # Optionally drop well limits (кроме смены знака)
+    if !limits_enabled
+        for f in case.forces
+            fF = f[:Facility]
+            for (k, c) in fF.control
+                fF.limits[k] = default_limits(c)
+            end
+        end
+    end
+
+    cache = Dict{Symbol,Any}()
+
+    function f!(x; grad=true)
+        X = reshape(x, n_ctrl, nstep_unique)
+
+        # Apply producer targets for each step
+        for stepno in 1:nstep
+            for (i, w) in enumerate(control_wells)
+                x_i = X[i, eachstep ? stepno : 1]
+                new_rate = max(x_i*max_rate, EPS_RATE)
+                fF = case.forces[stepno][:Facility]
+                old_ctrl = fF.control[w]
+                new_tgt  = TotalRateTarget(new_rate)
+                fF.control[w] = replace_target(old_ctrl, new_tgt)
+                # keep limits consistent
+                lims = get(fF.limits, w, default_limits(old_ctrl))
+                fF.limits[w] = merge(lims, as_limit(new_tgt))
+            end
+        end
+
+        # Forward simulate with current controls
+        simres = simulate_reservoir(case; output_substates = use_ministeps, info_level = -1, sim_arg...)
+        r = simres.result
+        dt_mini = report_timesteps(r.reports; ministeps=use_ministeps)
+
+        # NPV objective per step (reuse standard npv_objective signature)
+        function npv_obj(model, state, dt, step_info, forces_here)
+            return npv_objective(model, state, dt, step_info, forces_here;
+                timesteps = dt_mini,
+                injectors = injectors,    # still count injection costs
+                producers = producers,    # revenue from producers
+                maximize  = true,
+                oil_price = oil_price,
+                gas_price = gas_price,
+                water_price = water_price,
+                oil_cost  = oil_cost,
+                gas_cost  = gas_cost,
+                water_cost = water_cost,
+                discount_rate = discount_rate,
+                kwarg...
+            )
+        end
+
+        obj = Jutul.evaluate_objective(npv_obj, case.model, r.states, case.dt, case.forces)
+
+        if !grad
+            return obj
+        end
+
+        # ---- Adjoint gradient wrt controls on PRODUCERS ----
+        if !haskey(cache, :storage)
+            targets = Jutul.force_targets(case.model)
+            targets[:Facility][:control] = :control
+            targets[:Facility][:limits]  = nothing
+            cache[:storage] = Jutul.setup_adjoint_forces_storage(case.model, r.states, case.forces, case.dt, npv_obj;
+                state0 = case.state0, parameters = case.parameters, targets = targets,
+                eachstep = eachstep, di_sparse = true
+            )
+        end
+
+        dF, t_to_f, _ = Jutul.solve_adjoint_forces!(cache[:storage], case.model, r.states, r.reports, npv_obj, case.forces;
+            state0 = case.state0, parameters = case.parameters
+        )
+
+        dX = zeros(n_ctrl, nstep_unique)
+        for stepno in 1:nstep_unique
+            fF = dF[stepno][:Facility]
+            for (i, w) in enumerate(control_wells)
+                # Sensitivity of objective wrt well target value
+                ctrl = fF.control[w]
+                ∂obj_∂q = ctrl.target.value
+                dX[i, stepno] = ∂obj_∂q * max_rate
+            end
+        end
+        return (obj, vec(dX))
+    end
+
+    x0 = fill(base_rate/max_rate, n_ctrl*nstep_unique)
+
+    F! = x -> f!(x; grad=false)
+    function F_and_dF!(g, x)
+        obj, grad = f!(x; grad=true)
+        g .= grad
+        return obj
+    end
+    function dF!(g, x)
+        _, grad = f!(x; grad=true)
+        g .= grad
+        return g
+    end
+
+    return (case=case, x0=x0, obj=F!, F_and_dF=F_and_dF!, dF=dF!, lin_eq=NamedTuple())
 end
 
-# --- 3) Три кейса
-const_case, npv_const_opt = optimize_case(base_case, :first)
-var_case,   npv_var_opt   = optimize_case(base_case, :each)
+# ---------- High-level driver (like original) ----------
+base_rate = base_rate_from_producers(coarse_case)
+println("Base rate (from producers) = $(base_rate) [SI units of volume/time]")
 
-# --- 4) Прогоны
-ws_base,  _ = simulate_reservoir(base_case,  info_level = -1)
-ws_const, _ = simulate_reservoir(const_case, info_level = -1)
-ws_var,   _ = simulate_reservoir(var_case,   info_level = -1)
+function optimize_producer_rates(steps; use_box_bfgs = true)
+    setup = setup_producer_rate_optimization_objective(coarse_case, base_rate;
+        max_rate_factor = 10.0,
+        oil_price = 100.0, water_price = -10.0, water_cost = 5.0,
+        discount_rate = 0.05,
+        steps = steps,
+        use_ministeps = true,
+        verbose = true,
+        sim_arg = (precond = :cprw, linear_solver = :bicgstab, info_level = -1)
+    )
+    if use_box_bfgs
+        # bound-constrained BFGS on unit-box
+        obj_best, x_best, hist = Jutul.unit_box_bfgs(setup.x0, setup.obj;
+            maximize = true, lin_eq = setup.lin_eq
+        )
+        H = hist.val
+    else
+        lower = zeros(length(setup.x0)); upper = ones(length(setup.x0))
+        results, x_best = lbfgsb(setup.F_and_dF, setup.dF, setup.x0;
+            lb=lower, ub=upper, iprint=1, factr=1e12, maxfun=20, maxiter=20, m=20
+        )
+        H = results
+    end
+    return (setup.case, H, x_best)
+end
 
-# --- 5) Единый расчёт NPV по результатам
+# ---------- Run two strategies: one-set and per-step ----------
+case1, hist1, x1 = optimize_producer_rates(:first)
+case2, hist2, x2 = optimize_producer_rates(:each)
+
+# ---------- Plots ----------
+# Allocation (constant)
+fig = Figure()
+ax = Axis(fig[1,1], xlabel="Producer index", ylabel="Rate fraction (of max producer rate)", title="Constant producer-rate allocation")
+scatter!(ax, 1:length(x1), x1)
+fig
+
+# Allocation per step
+allocs = reshape(x2, length(x1), :)
+fig = Figure()
+ax = Axis(fig[1,1], xlabel="Report step", ylabel="Rate fraction (of max producer rate)", title="Producer-rate per step")
+for i in axes(allocs, 1)
+    lines!(ax, allocs[i, :], label = "Producer #$i")
+end
+axislegend()
+fig
+
+# NPV evolution
+fig = Figure()
+ax = Axis(fig[1,1], xlabel="LBFGS iteration", ylabel="Net present value (million USD)")
+scatter!(ax, 1:length(hist1), hist1./1e6, label="Constant producer rates")
+scatter!(ax, 1:length(hist2), hist2./1e6, marker=:x, label="Per-step producer rates")
+axislegend(position=:rb)
+fig
+
+# ---------- Simulate and compare field curves ----------
+ws0, states0 = simulate_reservoir(coarse_case, info_level = -1)
+ws1, states1 = simulate_reservoir(case1,       info_level = -1)
+ws2, states2 = simulate_reservoir(case2,       info_level = -1)
+
+# Field measurables (if you have reservoir_measurables in scope)
+f0 = reservoir_measurables(coarse_case, ws0, states0; type=:field)
+f1 = reservoir_measurables(case1,       ws1, states1; type=:field)
+f2 = reservoir_measurables(case2,       ws2, states2; type=:field)
+
 bbl = si_unit(:stb)
-function npv_from_ws(model, ws; po = OIL_PRICE, pw = WATER_PRICE, ci = WATER_COST, r = DISC)
-    f = reservoir_measurables(model, ws)
-    t_years = (ws.time ./ si_unit(:day)) ./ 365.0
-    fopt = f[:fopt].values ./ bbl   # нефть, cum stb
-    fwpt = f[:fwpt].values ./ bbl   # вода добытая, cum stb
-    fwit = f[:fwit].values ./ bbl   # вода закачанная, cum stb
 
-    dOil = diff(vcat(0.0, fopt))
-    dWpr = diff(vcat(0.0, fwpt))
-    dWin = diff(vcat(0.0, fwit))
-    disc = (1 .+ r).^(-t_years)
+# Cumulative oil
+fig = Figure()
+ax = Axis(fig[1,1], xlabel="Time / days", ylabel="Field oil production (accumulated, bbl)")
+t = ws0.time ./ si_unit(:day)
+lines!(ax, t, f0[:fopt].values./bbl, label="Base")
+lines!(ax, t, f1[:fopt].values./bbl, label="Const prod-rate")
+lines!(ax, t, f2[:fopt].values./bbl, label="Per-step prod-rate")
+axislegend(position=:rb)
+fig
 
-    return sum( (po .* dOil .+ pw .* dWpr .- ci .* dWin) .* disc )
-end
-
-npv_base  = npv_from_ws(base_case.model,  ws_base)
-npv_const = npv_from_ws(const_case.model, ws_const)
-npv_var   = npv_from_ws(var_case.model,   ws_var)
-
-# --- 6) Текстовый вывод
-vals = [
-    ("Base (as DATA)",      npv_base),
-    ("Optimized: constant", npv_const),
-    ("Optimized: per-step", npv_var),
-]
-println("\nNPV, USD:")
-for (name, v) in vals
-    println(rpad("  "*name*":", 28), round(v, sigdigits = 7))
-end
-println("\nObjective at optimizer last iter (USD):")
-println("  constant: ", round(npv_const_opt, sigdigits = 7))
-println("  per-step: ", round(npv_var_opt,   sigdigits = 7))
-
-# --- 7) Бар-график NPV (в млн $)
-labels = ["Base", "Constant", "Per-step"]
-npv_vals = [npv_base, npv_const, npv_var] ./ 1e6  # млн USD
-
-fig = Figure(size = (720, 420))
-ax  = Axis(fig[1, 1], ylabel = "NPV (million USD)", title = "NPV comparison")
-barplot!(ax, 1:length(npv_vals), npv_vals)
-ax.xticks = (1:length(labels), labels)
-
-# подписи над столбцами
-for (i, v) in enumerate(npv_vals)
-    text!(ax, i, v, text = string(round(v, digits = 2)), align = (:center, :bottom))
-end
-
-fig  # показать окно
-# при необходимости можно сохранить:
-# save("npv_bar.png", fig)
+# Cumulative water
+fig = Figure()
+ax = Axis(fig[1,1], xlabel="Time / days", ylabel="Field water production (accumulated, bbl)")
+lines!(ax, t, f0[:fwpt].values./bbl, label="Base")
+lines!(ax, t, f1[:fwpt].values./bbl, label="Const prod-rate")
+lines!(ax, t, f2[:fwpt].values./bbl, label="Per-step prod-rate")
+axislegend(position=:rb)
+fig
