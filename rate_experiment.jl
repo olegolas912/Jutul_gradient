@@ -3,17 +3,18 @@
 # (control = production well rates instead of injectors)
 # ==========================================
 using Jutul, JutulDarcy, GLMakie, GeoEnergyIO, HYPRE, LBFGSB
+using Statistics: mean
 
-# Optional: use local helper/objectives (QoI + NPV) if you have them as files
-# Include only if needed in your project layout:
-# include("utils.jl")        # for reservoir_measurables, etc., if not from package
-# include("objectives.jl")   # for compute_well_qoi, npv_objective
+# Если в проекте есть локальные утилиты/цели — подключаем
+# (в них обычно лежат compute_well_qoi, reservoir_measurables, npv_objective, report_timesteps)
+include("utils.jl")
+include("objectives.jl")
 
 # ---------- Load and coarsen EGG case (same as original example) ----------
-data_dir = GeoEnergyIO.test_input_file_path("EGG")
-data_pth = joinpath(data_dir, "EGG.DATA")
-fine_case   = setup_case_from_data_file(data_pth)
-coarse_case = coarsen_reservoir_case(fine_case[1:50], (20, 20, 3), method = :ijk)
+data_dir  = GeoEnergyIO.test_input_file_path("EGG")
+data_pth  = joinpath(data_dir, "EGG.DATA")
+fine_case = setup_case_from_data_file(data_pth)
+coarse_case = coarsen_reservoir_case(fine_case[1:50], (20, 20, 3); method = :ijk)
 
 # ---------- Helpers ----------
 const EPS_RATE = 1e-12
@@ -35,7 +36,7 @@ function get_well_lists(case::JutulCase)
 end
 
 function liquid_rate_of_well(model, state, forces, w::Symbol)
-    # Prefer SurfaceLiquidRateTarget; fall back to oil+water if needed
+    # Предпочтительно surface liquid rate; если нет — oil + water
     try
         return abs(compute_well_qoi(model, state, forces, w, SurfaceLiquidRateTarget))
     catch
@@ -53,17 +54,15 @@ function liquid_rate_of_well(model, state, forces, w::Symbol)
 end
 
 function base_rate_from_producers(case::JutulCase; default_if_zero=convert_to_si(100.0, :stb)/si_unit(:day))
-    ws, states = simulate_reservoir(case, info_level = -1)
-    model = case.model
+    ws, states = simulate_reservoir(case; info_level = -1)
+    model   = case.model
     forces1 = case.forces[1]
     _, producers = get_well_lists(case)
-    if isempty(producers)
-        error("В кейсе не найдены добывающие скважины.")
-    end
-    # возьмем средний дебит по продюсерам на первом репорт-шаге
-    s1 = states[1]
+    isempty(producers) && error("В кейсе не найдены добывающие скважины.")
+    # берём средний дебит по продюсерам на первом отчётном шаге
+    s1   = states[1]
     vals = [liquid_rate_of_well(model, s1, forces1, w) for w in producers]
-    br = mean(vals)
+    br   = mean(vals)
     return br > EPS_RATE ? br : default_if_zero
 end
 
@@ -71,10 +70,10 @@ end
 """
     setup_producer_rate_optimization_objective(case, base_rate; kwargs...)
 
-Похоже на setup_rate_optimization_objective из примера, но:
-- список управляемых скважин = добывающие (ProducerControl),
-- целевая функция NPV учитывает выручку продюсеров и (как обычно) стоимость закачки инжекторов,
-- градиент считается по целевым квотам продюсеров (TotalRateTarget).
+Как setup_rate_optimization_objective, но управляем добывающими скважинами:
+- управление: ProducerControl → TotalRateTarget
+- NPV: выручка с продюсеров и (как обычно) стоимость закачки инжекторов
+- градиент: по целям продюсеров (TotalRateTarget)
 """
 function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
         max_rate_factor = 10.0,
@@ -94,29 +93,27 @@ function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
         kwarg...
     )
     steps in (:first, :each) || error("steps must be :first or :each")
+    myprint(s) = (verbose && println(s))
 
-    function myprint(s) verbose && println(s) end
-
-    # Copy forces per step to freely modify controls during optimization
-    nstep = length(case.dt)
+    # Свободно редактируем forces поминутно
+    nstep  = length(case.dt)
     forces = case.forces isa Vector ? [deepcopy(f) for f in case.forces] : [deepcopy(case.forces) for _ in 1:nstep]
     case   = JutulCase(case.model, case.dt, forces; state0=case.state0, parameters=case.parameters)
 
-    # Detect wells by control type
+    # Инжекторы/продюсеры
     injectors, producers = get_well_lists(case)
-    isempty(producers)  && error("Не найдены добывающие скважины.")
-    isempty(injectors)  && myprint("Внимание: инжекторов нет — затраты на закачку будут нулевыми.")
+    isempty(producers) && error("Не найдены добывающие скважины.")
+    isempty(injectors) && myprint("Внимание: инжекторов нет — затраты на закачку будут нулевыми.")
 
-    # Controlled wells are PRODUCERS
     control_wells = producers
     n_ctrl = length(control_wells)
     myprint("Управляемые скважины (добывающие): $control_wells; всего = $n_ctrl")
 
-    eachstep = steps == :each
-    nstep_unique = eachstep ? nstep : 1
-    max_rate = max_rate_factor*base_rate
+    eachstep      = steps == :each
+    nstep_unique  = eachstep ? nstep : 1
+    max_rate      = max_rate_factor*base_rate
 
-    # Optionally drop well limits (кроме смены знака)
+    # По желанию — «сбросить» лимиты (оставляя корректный знак)
     if !limits_enabled
         for f in case.forces
             fF = f[:Facility]
@@ -131,7 +128,7 @@ function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
     function f!(x; grad=true)
         X = reshape(x, n_ctrl, nstep_unique)
 
-        # Apply producer targets for each step
+        # Применяем цели дебита для продюсеров
         for stepno in 1:nstep
             for (i, w) in enumerate(control_wells)
                 x_i = X[i, eachstep ? stepno : 1]
@@ -140,23 +137,23 @@ function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
                 old_ctrl = fF.control[w]
                 new_tgt  = TotalRateTarget(new_rate)
                 fF.control[w] = replace_target(old_ctrl, new_tgt)
-                # keep limits consistent
+                # синхронизируем лимиты с таргетом
                 lims = get(fF.limits, w, default_limits(old_ctrl))
                 fF.limits[w] = merge(lims, as_limit(new_tgt))
             end
         end
 
-        # Forward simulate with current controls
+        # Прямой прогон
         simres = simulate_reservoir(case; output_substates = use_ministeps, info_level = -1, sim_arg...)
         r = simres.result
         dt_mini = report_timesteps(r.reports; ministeps=use_ministeps)
 
-        # NPV objective per step (reuse standard npv_objective signature)
+        # Целевая: NPV на шаг
         function npv_obj(model, state, dt, step_info, forces_here)
             return npv_objective(model, state, dt, step_info, forces_here;
                 timesteps = dt_mini,
-                injectors = injectors,    # still count injection costs
-                producers = producers,    # revenue from producers
+                injectors = injectors,  # стоимость закачки
+                producers = producers,  # выручка с добычи
                 maximize  = true,
                 oil_price = oil_price,
                 gas_price = gas_price,
@@ -175,18 +172,20 @@ function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
             return obj
         end
 
-        # ---- Adjoint gradient wrt controls on PRODUCERS ----
+        # Обратный прогон: градиент по управляющим воздействиями (целям продюсеров)
         if !haskey(cache, :storage)
             targets = Jutul.force_targets(case.model)
             targets[:Facility][:control] = :control
             targets[:Facility][:limits]  = nothing
-            cache[:storage] = Jutul.setup_adjoint_forces_storage(case.model, r.states, case.forces, case.dt, npv_obj;
+            cache[:storage] = Jutul.setup_adjoint_forces_storage(
+                case.model, r.states, case.forces, case.dt, npv_obj;
                 state0 = case.state0, parameters = case.parameters, targets = targets,
                 eachstep = eachstep, di_sparse = true
             )
         end
 
-        dF, t_to_f, _ = Jutul.solve_adjoint_forces!(cache[:storage], case.model, r.states, r.reports, npv_obj, case.forces;
+        dF, _, _ = Jutul.solve_adjoint_forces!(
+            cache[:storage], case.model, r.states, r.reports, npv_obj, case.forces;
             state0 = case.state0, parameters = case.parameters
         )
 
@@ -194,7 +193,7 @@ function setup_producer_rate_optimization_objective(case::JutulCase, base_rate;
         for stepno in 1:nstep_unique
             fF = dF[stepno][:Facility]
             for (i, w) in enumerate(control_wells)
-                # Sensitivity of objective wrt well target value
+                # чувствительность цели по значению таргета скважины
                 ctrl = fF.control[w]
                 ∂obj_∂q = ctrl.target.value
                 dX[i, stepno] = ∂obj_∂q * max_rate
@@ -232,10 +231,10 @@ function optimize_producer_rates(steps; use_box_bfgs = true)
         steps = steps,
         use_ministeps = true,
         verbose = true,
-        sim_arg = (precond = :cprw, linear_solver = :bicgstab, info_level = -1)
+        sim_arg = (precond = :cprw, linear_solver = :bicgstab, info_level = -1),
     )
     if use_box_bfgs
-        # bound-constrained BFGS on unit-box
+        # Bound-constrained BFGS на unit-box (из Jutul)
         obj_best, x_best, hist = Jutul.unit_box_bfgs(setup.x0, setup.obj;
             maximize = true, lin_eq = setup.lin_eq
         )
@@ -280,11 +279,11 @@ axislegend(position=:rb)
 fig
 
 # ---------- Simulate and compare field curves ----------
-ws0, states0 = simulate_reservoir(coarse_case, info_level = -1)
-ws1, states1 = simulate_reservoir(case1,       info_level = -1)
-ws2, states2 = simulate_reservoir(case2,       info_level = -1)
+ws0, states0 = simulate_reservoir(coarse_case; info_level = -1)
+ws1, states1 = simulate_reservoir(case1;       info_level = -1)
+ws2, states2 = simulate_reservoir(case2;       info_level = -1)
 
-# Field measurables (if you have reservoir_measurables in scope)
+# Field measurables
 f0 = reservoir_measurables(coarse_case, ws0, states0; type=:field)
 f1 = reservoir_measurables(case1,       ws1, states1; type=:field)
 f2 = reservoir_measurables(case2,       ws2, states2; type=:field)
