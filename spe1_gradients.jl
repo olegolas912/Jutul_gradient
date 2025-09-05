@@ -135,6 +135,7 @@ fig
 dprm_case = setup_reservoir_dict_optimization(case)
 free_optimization_parameters!(dprm_case)
 dprm_grad = parameters_gradient_reservoir(dprm_case, mismatch_objective);
+dprm_grad[:wells][:PROD]
 # ## Plot the gradient of the mismatch objective with respect to the porosity
 # We see, as expected, that the gradient is largest in magnitude around the
 # wells and near the front of the displacement.
