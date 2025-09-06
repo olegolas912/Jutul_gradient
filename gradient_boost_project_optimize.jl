@@ -169,18 +169,12 @@ _get_poro_grad_scalar(grad_dict) :: Float64
 
 Находит в словаре `grad_dict` градиент по пористости (вектор по ячейкам),
 берёт среднее по ячейкам (устойчивее, чем сумма) и возвращает скаляр.
-Учитывает разные возможные ключи (:model / "model", :porosity / "porosity" / :PORO / "PORO").
+Учитывает разные возможные ключи (:model, :porosity).
 """
-@inline function _get_poro_grad_scalar(grad_dict)::Float64
-    mk = haskey(grad_dict, :model) ? :model :
-         haskey(grad_dict, "model") ? "model" : error("no :model in grad")
-    gm = grad_dict[mk]
-    pk = haskey(gm, :porosity) ? :porosity :
-         haskey(gm, "porosity") ? "porosity" :
-         haskey(gm, :PORO) ? :PORO :
-         haskey(gm, "PORO") ? "PORO" : error("no porosity/PORO in grad[:model]")
-    return mean(gm[pk])::Float64
-end
+@inline _get_poro_grad_scalar(g) = mean(g[:model][:porosity])
+# @inline _get_poro_grad_vector(g) = g[:model][:porosity]
+# @inline _get_poro_grad_scalar(g, pv) = dot(g[:model][:porosity], pv) / sum(pv)
+
 
 # -----------------------------------------------------------
 # 7) Оценка лосса и градиента для заданного poro
@@ -280,11 +274,11 @@ end
 
 # poro0 — стартовое значение (берём 80% от «истины» и ограничиваем)
 poro0   = clamp(x_truth * 0.80, 1e-6, 1.0)
-η       = 1e-4          # начальный шаг
+η       = 1e-3          # начальный шаг
 nrounds = 10            # число итераций
 
 # result.losses — траектория лосса; result.poros — траектория poro; result.poro_final — итог
-result = train_boosting_scalar!(poro0; η=1e-4, nrounds=nrounds,
+result = train_boosting_scalar!(poro0; η=η, nrounds=nrounds,
                                 tol_target=1e-8, poro_star=x_truth,
                                 poro_min=1e-6, poro_max=1.0,
                                 verbose=true)
