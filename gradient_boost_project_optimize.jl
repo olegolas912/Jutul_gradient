@@ -6,7 +6,7 @@ using ForwardDiff: value
 # Глобальные флаги
 # -----------------------------------------------------------
 USE_FASTMATH = false  # ускорение за счёт @fastmath (возможна потеря точности на уровне УЛП)
-PLOT = true          # включить графики (GLMakie)
+PLOT = true           # включить графики (GLMakie)
 
 if PLOT
     using GLMakie
@@ -68,7 +68,8 @@ const case_true = build_case_with_poro(x_truth)
 
 # states_true :: Vector{State} — последовательность состояний на отчётных шагах
 # (используем как целевые давления, к которым подгоняемся).
-const states_true = let tmp = simulate_reservoir(case_true); tmp[2]; end
+const (_, states_true) = simulate_reservoir(case_true)
+
 
 # -----------------------------------------------------------
 # 3) Временная сетка и масштабы нормировки лосса
@@ -168,18 +169,12 @@ _get_poro_grad_scalar(grad_dict) :: Float64
 
 Находит в словаре `grad_dict` градиент по пористости (вектор по ячейкам),
 берёт среднее по ячейкам (устойчивее, чем сумма) и возвращает скаляр.
-Учитывает разные возможные ключи (:model / "model", :porosity / "porosity" / :PORO / "PORO").
+Учитывает разные возможные ключи (:model, :porosity).
 """
-@inline function _get_poro_grad_scalar(grad_dict)::Float64
-    mk = haskey(grad_dict, :model) ? :model :
-         haskey(grad_dict, "model") ? "model" : error("no :model in grad")
-    gm = grad_dict[mk]
-    pk = haskey(gm, :porosity) ? :porosity :
-         haskey(gm, "porosity") ? "porosity" :
-         haskey(gm, :PORO) ? :PORO :
-         haskey(gm, "PORO") ? "PORO" : error("no porosity/PORO in grad[:model]")
-    return mean(gm[pk])::Float64
-end
+@inline _get_poro_grad_scalar(g) = mean(g[:model][:porosity])
+# @inline _get_poro_grad_vector(g) = g[:model][:porosity]
+# @inline _get_poro_grad_scalar(g, pv) = dot(g[:model][:porosity], pv) / sum(pv)
+
 
 # -----------------------------------------------------------
 # 7) Оценка лосса и градиента для заданного poro
@@ -221,9 +216,6 @@ train_boosting_scalar!(poro0; kwargs...) :: NamedTuple
 - tol_target   — точность по попаданию в целевое значение poro_star (если задано)
 - tol_step     — критерий остановки по длине шага |Δ|
 - poro_star    — опциональный «истинный» таргет пористости
-- poro_min/max — проектор на допустимый диапазон [poro_min, poro_max]
-- use_bb       — вкл/выкл адаптацию η по BB (скалярный случай: η = |Δx|/|Δg|)
-- η_min/max    — зажим для адаптивного шага
 
 Возвращает:
 - (losses, poros, poro_final)
@@ -236,36 +228,18 @@ function train_boosting_scalar!(poro0::Float64;
                                 poro_star::Union{Nothing,Float64}=nothing,
                                 verbose::Bool=true,
                                 poro_min::Float64=1e-6,
-                                poro_max::Float64=1.0,
-                                use_bb::Bool=true,
-                                η_min::Float64=1e-6,
-                                η_max::Float64=1e-2)
+                                poro_max::Float64=1.0)
 
-    # Буферы для логирования траектории
-    losses = Vector{Float64}(undef, nrounds)  # значения лосса L_k
-    poros  = Vector{Float64}(undef, nrounds)  # значения poro после шага
-    K = 0                                     # реальное число итераций
+    losses = Vector{Float64}(undef, nrounds)
+    poros  = Vector{Float64}(undef, nrounds)
+    K = 0
 
-    # Текущее значение параметра и «предыдущие» для BB-шагов
-    poro      = clamp(poro0, poro_min, poro_max)
-    poro_prev = NaN
-    gprev     = NaN
+    poro = clamp(poro0, poro_min, poro_max)
 
     for k in 1:nrounds
-        # Lk — текущий лосс; gk — градиент ∂L/∂poro
         Lk, gk = evaluate_loss_and_grad(poro)
 
-        # Адаптация шага Барзилая–Борувайна (скаляр: η ≈ |Δx|/|Δg|)
-        if use_bb && k > 1
-            s = poro - poro_prev           # Δx_k
-            y = gk   - gprev               # Δg_k
-            denom = y*y
-            if isfinite(denom) && denom > eps() && isfinite(s)
-                η = clamp(abs(s)/abs(y), η_min, η_max)
-            end
-        end
-
-        # step — прирост параметра; poro_new — проектированный шаг
+        # фиксированный шаг
         step     = -η * gk
         poro_new = clamp(poro + step, poro_min, poro_max)
 
@@ -277,20 +251,18 @@ function train_boosting_scalar!(poro0::Float64;
             @info "iter=$(k)  loss=$(round(Lk, sigdigits=7))  poro=$(round(poro_new, sigdigits=8))  step=$(round(step, sigdigits=6))  grad=$(round(gk, sigdigits=6))  η=$(round(η, sigdigits=6))"
         end
 
-        # Критерии остановки
         if abs(step) < tol_step
             verbose && @info "Остановка: |Δ| < $tol_step"
-            poro = poro_new; break
+            poro = poro_new
+            break
         end
         if poro_star !== nothing && abs(poro_new - poro_star) < tol_target
             verbose && @info "Остановка: |poro - porо*| < $tol_target"
-            poro = poro_new; break
+            poro = poro_new
+            break
         end
 
-        # Подготовка к следующему шагу
-        poro_prev = poro
-        gprev     = gk
-        poro      = poro_new
+        poro = poro_new
     end
 
     return (losses=losses[1:K], poros=poros[1:K], poro_final=poro)
@@ -302,14 +274,15 @@ end
 
 # poro0 — стартовое значение (берём 80% от «истины» и ограничиваем)
 poro0   = clamp(x_truth * 0.80, 1e-6, 1.0)
-η       = 1e-4          # начальный шаг
+η       = 1e-3          # начальный шаг
 nrounds = 10            # число итераций
 
 # result.losses — траектория лосса; result.poros — траектория poro; result.poro_final — итог
 result = train_boosting_scalar!(poro0; η=η, nrounds=nrounds,
                                 tol_target=1e-8, poro_star=x_truth,
                                 poro_min=1e-6, poro_max=1.0,
-                                verbose=true, use_bb=true)
+                                verbose=true)
+
 
 @info "Итог: poro_final=$(result.poro_final)  truth=$(x_truth)  abs.err=$(abs(result.poro_final - x_truth))"
 
