@@ -1,9 +1,10 @@
 #############################
-# SPE1 truth + oil-rate mismatch (reports) + porosity fit (FD gradient)
+# SPE1 truth + adjoint (oil-rate mismatch) + ∂L/∂porosity
 #############################
 
 using Jutul, JutulDarcy, GeoEnergyIO
 using Statistics: mean
+using ForwardDiff: value
 
 const PLOT = true
 if PLOT
@@ -11,8 +12,19 @@ if PLOT
 end
 
 # -------------------------------
-# 0) SPE1: чтение и базовый кейс
+# 0) SPE1 и постройка кейса с пористостью
 # -------------------------------
+
+
+data_pth = joinpath(JutulDarcy.GeoEnergyIO.test_input_file_path("SPE1"), "SPE1.DATA")
+data_pth = joinpath(JutulDarcy.GeoEnergyIO.test_input_file_path("SPE9"), "SPE9.DATA")
+data_pth = joinpath(JutulDarcy.GeoEnergyIO.test_input_file_path("EGG"), "EGG.DATA")
+data_pth = joinpath(JutulDarcy.GeoEnergyIO.test_input_file_path("NORNE_NOHYST"), "NORNE_NOHYST.DATA")
+
+data = parse_data_file(data_pth);
+case = setup_case_from_data_file(data);
+
+
 const data_pth  = joinpath(GeoEnergyIO.test_input_file_path("SPE1"), "SPE1.DATA")
 const data_raw  = parse_data_file(data_pth)
 const data_work = deepcopy(data_raw)
@@ -23,106 +35,133 @@ const data_work = deepcopy(data_raw)
 end
 
 # -------------------------------
-# 1) Истина: один прогон и ряды из res.wells[:PROD]
+# 1) «Истина»: один прогон и ряды из res_true.wells[:PROD]
 # -------------------------------
 const case_true = setup_case_from_data_file(data_raw)
 @time res_true = simulate_reservoir(case_true)
 
 const PROD = :PROD
-const q_oil_true  = Float64.(res_true.wells[PROD][:orat])  # нефте-дебит
-const bhp_true_Pa = Float64.(res_true.wells[PROD][:bhp])   # давление (Па)
-const t_true      = res_true.time
-
+const q_oil_true = Float64.(res_true.wells[PROD][:orat])  # нефте-дебит (по отчётам)
+const t_true     = res_true.time
 @assert length(q_oil_true) == length(t_true)
 
-# -------------------------------
-# 2) Лосс по дебиту нефти (с отчётов)
-# -------------------------------
-function oilrate_mse_loss(res_pred, q_true::AbstractVector{<:Real}; scale::Float64=100.0)
-    q_pred = Float64.(res_pred.wells[PROD][:orat])   # <-- фиксированная конвертация
-    K = min(length(q_true), length(q_pred))
-    s = 0.0
-    @inbounds @simd for i in 1:K
-        z = (q_pred[i] - q_true[i]) / scale
-        s += z*z
+# нормирующий масштаб (безразмерность лосса)
+const Q_SCALE = max(1e-8, maximum(abs.(q_oil_true)))
+const T_INV   = 1.0 / (t_true[end] - t_true[1])
+
+# ближайший отчётный индекс для времени t
+@inline function nearest_report_index(t::Float64, times)
+    i = searchsortedfirst(times, t)
+    if i <= 1
+        return 1
+    elseif i > length(times)
+        return length(times)
+    else
+        (t - times[i-1] <= times[i] - t) ? (i - 1) : i
     end
-    return s / K
 end
 
 # -------------------------------
-# 3) Оценка лосса и градиента (FD, центральная разность)
+# 2) Целевая функция для adjoint: MSE по q_oil (интегрально по времени)
 # -------------------------------
-function evaluate_L_and_g_fd(poro::Float64; eps_rel::Float64=1e-4, scale::Float64=100.0)
-    # базовый прогон
-    case0 = build_case_with_poro(poro)
-    t_fwd = @elapsed res0 = simulate_reservoir(case0)
-    L0 = oilrate_mse_loss(res0, q_oil_true; scale=scale)
+const _loss_acc = Ref(0.0)
 
-    # центральная разность
-    eps = eps_rel * max(1.0, abs(poro))
+function oilrate_objective_report(m, s, dt, step_info, forces)
+    # время текущей точки интегрирования
+    t = value(step_info[:time]) + dt
+    k = nearest_report_index(t, t_true)
 
-    case_p = build_case_with_poro(poro + eps)
-    res_p  = simulate_reservoir(case_p)
-    Lp     = oilrate_mse_loss(res_p, q_oil_true; scale=scale)
+    # «истина» по отчётам
+    q_true = q_oil_true[k]            # Float64
 
-    case_m = build_case_with_poro(poro - eps)
-    res_m  = simulate_reservoir(case_m)
-    Lm     = oilrate_mse_loss(res_m, q_oil_true; scale=scale)
+    # Живой дебит ИЗ ТЕКУЩЕГО состояния (оставляем тип Dual!)
+    q_curr = JutulDarcy.compute_well_qoi(m, s, forces, :PROD, :orat)
 
-    g = (Lp - Lm) / (2eps)
-    return L0, g, t_fwd
+    # безразмерная ошибка; z – Dual
+    z = (q_curr - q_true) / Q_SCALE
+
+    # интегральный вклад по времени; contrib – Dual
+    contrib = dt * (z*z) * T_INV
+
+    # в аккумулятор кладём численное значение (Float64),
+    # но наружу возвращаем Dual для корректного градиента
+    _loss_acc[] += value(contrib)
+    return contrib
+end
+
+
+# -------------------------------
+# 3) Извлечение ∂L/∂porosity из словаря градиента
+# -------------------------------
+@inline function poro_grad_scalar(grad_dict)::Float64
+    v = grad_dict[:model][:porosity]
+    return v isa AbstractArray ? mean(v) : Float64(v)
 end
 
 # -------------------------------
-# 4) Градиентный спуск по пористости (без BB)
+# 4) Оценка лосса и градиента через встроенный adjoint
 # -------------------------------
-function train_porosity_fd!(poro0::Float64;
-                            η::Float64=1e-2,
-                            nrounds::Int=12,
-                            tol_step::Float64=1e-8,
-                            poro_min::Float64=1e-6,
-                            poro_max::Float64=1.0,
-                            eps_rel::Float64=1e-4,
-                            scale::Float64=100.0)
+function evaluate_L_and_g_adjoint(poro::Float64)
+    case_c    = build_case_with_poro(poro)
+    dprm_case = setup_reservoir_dict_optimization(case_c)
+    free_optimization_parameters!(dprm_case)
 
-    losses = Float64[]; poros = Float64[]; times = Float64[]
+    # опционально: чистый forward для тайминга
+    t_fwd_est = @elapsed simulate_reservoir(case_c)
+
+    _loss_acc[] = 0.0
+    t_grad_total = @elapsed gdict = parameters_gradient_reservoir(dprm_case, oilrate_objective_report)
+
+    L = _loss_acc[]
+    g = poro_grad_scalar(gdict)
+    t_adj_est = max(t_grad_total - t_fwd_est, 0.0)
+
+    return L, g, (t_fwd=t_fwd_est, t_grad=t_grad_total, t_adj=t_adj_est)
+end
+
+# -------------------------------
+# 5) Градиентный спуск (фиксированный η, без BB)
+# -------------------------------
+function train_porosity_adjoint!(poro0::Float64;
+                                 η::Float64=1e-4,
+                                 nrounds::Int=20,
+                                 poro_min::Float64=1e-6,
+                                 poro_max::Float64=1.0)
+
+    losses = Float64[]; poros = Float64[]
+    fwd_t  = Float64[]; adj_t = Float64[]; grad_t = Float64[]
+
     x = clamp(poro0, poro_min, poro_max)
 
     for k in 1:nrounds
-        Lk, gk, t_fwd = evaluate_L_and_g_fd(x; eps_rel=eps_rel, scale=scale)
+        Lk, gk, tms = evaluate_L_and_g_adjoint(x)
 
         step = -η * gk
-        x_new = clamp(x + step, poro_min, poro_max)
+        x = clamp(x + step, poro_min, poro_max)
 
-        push!(losses, Lk); push!(poros, x_new); push!(times, t_fwd)
-        @info "iter=$(k)  L=$(round(Lk, sigdigits=7))  poro=$(round(x_new, sigdigits=8))  " *
-              "step=$(round(step, sigdigits=6))  grad=$(round(gk, sigdigits=6))  η=$(round(η, sigdigits=6))  " *
-              "| t_fwd≈$(round(t_fwd, digits=3)) s"
+        push!(losses, Lk); push!(poros, x)
+        push!(fwd_t, tms.t_fwd); push!(adj_t, tms.t_adj); push!(grad_t, tms.t_grad)
 
-        if abs(step) < tol_step
-            x = x_new
-            break
-        end
-        x = x_new
+        @info "iter=$(k)  L=$(round(Lk, sigdigits=7))  poro=$(round(x, sigdigits=8))  " *
+              "step=$(round(step, sigdigits=6))  grad=$(round(gk, sigdigits=6))  η=$(round(η, sigdigits=6))  |  " *
+              "t_fwd≈$(round(tms.t_fwd, digits=3)) s  t_adj≈$(round(tms.t_adj, digits=3)) s  t_grad=$(round(tms.t_grad, digits=3)) s"
     end
 
-    return (losses=losses, poros=poros, poro_final=x, fwd_times=times)
+    return (losses=losses, poros=poros, poro_final=x,
+            fwd_times=fwd_t, adj_times=adj_t, grad_total_times=grad_t)
 end
 
 # -------------------------------
-# 5) Запуск и графики
+# 6) Запуск и сравнение
 # -------------------------------
 const poro_guess = only(unique(data_raw["GRID"]["PORO"]))
 poro0 = clamp(poro_guess * 0.7, 1e-6, 1.0)
 
-const Q_SCALE = max(1e-8, maximum(abs.(q_oil_true)))
-
-
-result = train_porosity_fd!(poro0; η=1e-4, nrounds=12, eps_rel=1e-4, scale=Q_SCALE)
+result = train_porosity_adjoint!(poro0; η=3e-2, nrounds=12)
 
 @info "Итог: poro_final = $(result.poro_final)"
 
-# Итоговый прогон и сравнение рядов q_oil
+# постфактум сравнение рядов q_oil
 case_fit = build_case_with_poro(result.poro_final)
 res_fit  = simulate_reservoir(case_fit)
 q_oil_fit = Float64.(res_fit.wells[PROD][:orat])
@@ -130,7 +169,7 @@ Kp = min(length(q_oil_true), length(q_oil_fit))
 
 if PLOT
     fig1 = Figure(size=(900, 300))
-    ax1  = Axis(fig1[1,1], title="Loss vs iteration (q_oil mismatch via reports)", xlabel="iteration", ylabel="loss")
+    ax1  = Axis(fig1[1,1], title="Loss vs iteration (adjoint, q_oil mismatch)", xlabel="iteration", ylabel="loss")
     lines!(ax1, 1:length(result.losses), result.losses)
     #display(fig1)
 

@@ -13,17 +13,14 @@ if PLOT
 end
 
 # -------------------------------------------
-# 0) Данные и базовый кейс
+# 0) Данные и базовый кейс (NORNE_NOHYST)
 # -------------------------------------------
-const data_pth = joinpath(GeoEnergyIO.test_input_file_path("SPE1"), "SPE1.DATA")
-# const data_pth = joinpath(GeoEnergyIO.test_input_file_path("SPE9"), "SPE9.DATA")
-# const data_pth = joinpath(GeoEnergyIO.test_input_file_path("EGG"), "EGG.DATA")
-# const data_pth = joinpath(GeoEnergyIO.test_input_file_path("NORNE_NOHYST"), "NORNE_NOHYST.DATA")
+const data_pth = joinpath(GeoEnergyIO.test_input_file_path("NORNE_NOHYST"), "NORNE_NOHYST.DATA")
 
 using FilePathsBase: basename
 root, _ = splitext(basename(data_pth))          # <- тут раскладываем кортеж
 const MODEL_TAG = replace(root, r"\W+" => "_")  # очищаем до [A-Za-z0-9_]
-const OUTDIR    = joinpath(pwd(), "figs")
+const OUTDIR    = joinpath(pwd(), "fig")
 isdir(OUTDIR) || mkpath(OUTDIR)
 
 const data_raw  = parse_data_file(data_pth)
