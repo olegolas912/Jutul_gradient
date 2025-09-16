@@ -1,0 +1,6 @@
+mode,variant,ranks,threads_per_rank,nthreads,t_total,t_sim,t_setup,t_path,notes,timestamp
+serial,serial-1t-cprw-step,1,1,1,30.616167068481445,23.347853183746338,7.262562990188599,0.005750894546508789,"CPR update=step, partial",2025-09-17T02:01:33
+threads,threads-8t-cprw-step,1,8,8,26.583667993545532,19.610629081726074,6.967185974121094,0.005852937698364258,"CPR update=step, partial",2025-09-17T02:16:54
+mpi,mpi-4r-1t-cprw-iteration,4,1,4,68.86,60.91,7.94,0.006,"CPR update=iteration, partial=false",2025-09-17T02:08:19
+mpi,mpi-4r-1t-cprw-step,4,1,4,67.07,59.14,7.92,0.006,"CPR update=step, partial=true",2025-09-17T02:11:45
+mpi,mpi-8r-1t-cprw-step,8,1,8,66.69,58.33,8.35,0.007,"CPR update=step, partial=true",2025-09-17T02:13:27

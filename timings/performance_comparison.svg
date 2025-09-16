@@ -1,0 +1,34 @@
+<svg xmlns='http://www.w3.org/2000/svg' width='720' height='400' viewBox='0 0 720 400'>
+<rect width='100%' height='100%' fill='white'/>
+<text x='360.0' y='20.0' text-anchor='middle' font-size='18' font-family='sans-serif'>Norne performance comparison</text>
+<line x1='80' y1='320' x2='680' y2='320' stroke='black' stroke-width='1'/>
+<line x1='80' y1='40' x2='80' y2='320' stroke='black' stroke-width='1'/>
+<line x1='75' y1='320.0' x2='80' y2='320.0' stroke='black' stroke-width='1'/>
+<text x='70' y='324.0' text-anchor='end' font-size='12' font-family='sans-serif'>0.0</text>
+<line x1='75' y1='264.0' x2='80' y2='264.0' stroke='black' stroke-width='1'/>
+<text x='70' y='268.0' text-anchor='end' font-size='12' font-family='sans-serif'>13.8</text>
+<line x1='75' y1='208.0' x2='80' y2='208.0' stroke='black' stroke-width='1'/>
+<text x='70' y='212.0' text-anchor='end' font-size='12' font-family='sans-serif'>27.5</text>
+<line x1='75' y1='152.0' x2='80' y2='152.0' stroke='black' stroke-width='1'/>
+<text x='70' y='156.0' text-anchor='end' font-size='12' font-family='sans-serif'>41.3</text>
+<line x1='75' y1='96.0' x2='80' y2='96.0' stroke='black' stroke-width='1'/>
+<text x='70' y='100.0' text-anchor='end' font-size='12' font-family='sans-serif'>55.1</text>
+<line x1='75' y1='40.0' x2='80' y2='40.0' stroke='black' stroke-width='1'/>
+<text x='70' y='44.0' text-anchor='end' font-size='12' font-family='sans-serif'>68.9</text>
+<rect x='100.0' y='195.5' width='80.0' height='124.5' fill='#54a24b'/>
+<text x='140.0' y='340' text-anchor='middle' font-size='12' font-family='sans-serif' transform='rotate(25 140.0,340)'>serial-1t-cprw-step</text>
+<text x='140.0' y='190.5' text-anchor='middle' font-size='12' font-family='sans-serif'>30.62s</text>
+<rect x='220.0' y='211.9' width='80.0' height='108.1' fill='#4c78a8'/>
+<text x='260.0' y='340' text-anchor='middle' font-size='12' font-family='sans-serif' transform='rotate(25 260.0,340)'>threads-8t-cprw-step</text>
+<text x='260.0' y='206.9' text-anchor='middle' font-size='12' font-family='sans-serif'>26.58s</text>
+<rect x='340.0' y='40.0' width='80.0' height='280.0' fill='#f58518'/>
+<text x='380.0' y='340' text-anchor='middle' font-size='12' font-family='sans-serif' transform='rotate(25 380.0,340)'>mpi-4r-1t-cprw-iteration</text>
+<text x='380.0' y='35.0' text-anchor='middle' font-size='12' font-family='sans-serif'>68.86s</text>
+<rect x='460.0' y='47.3' width='80.0' height='272.7' fill='#f58518'/>
+<text x='500.0' y='340' text-anchor='middle' font-size='12' font-family='sans-serif' transform='rotate(25 500.0,340)'>mpi-4r-1t-cprw-step</text>
+<text x='500.0' y='42.3' text-anchor='middle' font-size='12' font-family='sans-serif'>67.07s</text>
+<rect x='580.0' y='48.8' width='80.0' height='271.2' fill='#f58518'/>
+<text x='620.0' y='340' text-anchor='middle' font-size='12' font-family='sans-serif' transform='rotate(25 620.0,340)'>mpi-8r-1t-cprw-step</text>
+<text x='620.0' y='43.8' text-anchor='middle' font-size='12' font-family='sans-serif'>66.69s</text>
+<text x='360.0' y='380' text-anchor='middle' font-size='14' font-family='sans-serif'>Total wall-time (seconds)</text>
+</svg>

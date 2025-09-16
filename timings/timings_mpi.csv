@@ -1,0 +1,4 @@
+mode,ranks,threads_per_rank,precond,cpr_update,cpr_partial,t_path,t_setup,t_sim,t_total,timestamp
+mpi,4,1,cprw,iteration,false,0.006,7.94,60.91,68.86,2025-09-17T02:08:19
+mpi,4,1,cprw,step,true,0.006,7.92,59.14,67.07,2025-09-17T02:11:45
+mpi,8,1,cprw,step,true,0.007,8.35,58.33,66.69,2025-09-17T02:13:27
