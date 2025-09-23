@@ -1,3 +1,3 @@
-step_index,t_report,forward_eval_mean_sec,forward_eval_std_sec,backward_eval_mean_sec,total_eval_mean_sec
-1,86400.000000000,0.014709,0.029216,3.032017,3.046726
-2,432000.000000000,0.021991,0.043657,3.032017,3.054007
+step_index,t_report,forward_eval_mean_sec,backward_eval_mean_sec,total_eval_mean_sec
+1,86400.000000000,0.001827,0.248400,0.250227
+2,432000.000000000,0.000171,0.248400,0.248571

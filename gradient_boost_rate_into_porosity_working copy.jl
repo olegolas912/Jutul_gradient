@@ -58,15 +58,14 @@ const RUN_CNT = Dict{Symbol, Int}(
 function write_step_timing_table_csv(path::AbstractString;
                                      t_report::Vector{Float64},
                                      fwd_mean::Vector{Float64},
-                                     fwd_std::Vector{Float64},
                                      bwd_mean::Vector{Float64},
                                      total_mean::Vector{Float64})
-    @assert length(t_report) == length(fwd_mean) == length(fwd_std) == length(bwd_mean) == length(total_mean)
+    @assert length(t_report) == length(fwd_mean) == length(bwd_mean) == length(total_mean)
     open(path, "w") do io
-        println(io, "step_index,t_report,forward_eval_mean_sec,forward_eval_std_sec,backward_eval_mean_sec,total_eval_mean_sec")
+        println(io, "step_index,t_report,forward_eval_mean_sec,backward_eval_mean_sec,total_eval_mean_sec")
         for i in eachindex(t_report)
-            @printf(io, "%d,%.9f,%.6f,%.6f,%.6f,%.6f\n",
-                    i, t_report[i], fwd_mean[i], fwd_std[i], bwd_mean[i], total_mean[i])
+            @printf(io, "%d,%.9f,%.6f,%.6f,%.6f\n",
+                    i, t_report[i], fwd_mean[i], bwd_mean[i], total_mean[i])
         end
     end
     return nothing
@@ -455,9 +454,8 @@ println("===============================================")
 nsteps = length(t_true)
 @assert all(length(v) == nsteps for v in FORWARD_BY_ITER)
 
-# средние и СКО по forward-времени на шаг
+# средние по forward-времени на шаг
 fwd_mean = [ mean(getindex.(FORWARD_BY_ITER, i)) for i in 1:nsteps ]
-fwd_std  = [  std(getindex.(FORWARD_BY_ITER, i)) for i in 1:nsteps ]
 
 # оценка backward: на каждой итерации берём (total - sum(forward)), делим поровну по шагам
 bwd_per_step_iters = Vector{Vector{Float64}}(undef, length(TOTAL_EVAL_SECS))
@@ -472,7 +470,7 @@ total_mean = [ fwd_mean[i] + bwd_mean[i] for i in 1:nsteps ]
 
 if SAVE_TIMINGS
     write_step_timing_table_csv(STEP_TABLE_CSV_PATH;
-        t_report = t_true, fwd_mean=fwd_mean, fwd_std=fwd_std,
+        t_report = t_true, fwd_mean=fwd_mean,
         bwd_mean=bwd_mean, total_mean=total_mean)
 
     # Итоговые агрегаты времени (для COUNTERS_CSV)

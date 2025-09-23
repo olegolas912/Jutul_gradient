@@ -5,8 +5,8 @@ function read_timing_csv(path::AbstractString)
     data, _ = readdlm(path, ',', header=true)
     step = Int64.(data[:, 1])
     forward_mean = Float64.(data[:, 3])
-    backward_mean = Float64.(data[:, 5])
-    total_mean = Float64.(data[:, 6])
+    backward_mean = Float64.(data[:, 4])
+    total_mean = Float64.(data[:, 5])
     return step, forward_mean, backward_mean, total_mean
 end
 
