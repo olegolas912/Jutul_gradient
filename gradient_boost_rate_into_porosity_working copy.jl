@@ -18,8 +18,15 @@ using CUDA
 # ---------------------------
 # CONFIG / META (для подписей и имён файлов)
 # ---------------------------
-const MODEL_NAME   = "NORNE_NOHYST"
-const QOI_BASIS    = "debites_well_rates" # "дебиты"
+const MODEL_NAME = "EGG"
+const WELL_QOI_CONFIG = (
+    label = "bhp_well_pressures",
+    selectors = (
+        (; key = :bhp, use_abs = false),
+    ),
+    scaling = :maxabs,
+)
+const QOI_BASIS = WELL_QOI_CONFIG.label
 const TARGET_PARAM = "PORO"
 const ARTIFACT_TAG = "model=$(MODEL_NAME)__qoi=$(QOI_BASIS)__target=$(TARGET_PARAM)"
 
@@ -119,13 +126,27 @@ RUN_CNT[:forward_truth] += 1
 # ---------------------------
 # 1) Истинные ряды QOI и масштабы per-well
 # ---------------------------
-function pick_qoi_key(wres)::Tuple{Symbol,Bool}
-    for k in (:orat, :orate, :qo, :oil); haskey(wres, k) && return (k, false); end
-    for k in (:wrat, :grat, :lrat);      haskey(wres, k) && return (k, true);  end
-    return (:missing, true)
+@inline function select_well_qoi(wres, config)::Tuple{Symbol,Bool}
+    for sel in config.selectors
+        key = sel.key
+        haskey(wres, key) || continue
+        return (key, sel.use_abs)
+    end
+    return (:missing, false)
 end
 
-function build_truth_per_well_all(res)
+@inline function well_series_scale(series::AbstractVector{<:Real}, config)::Float64
+    mode = config.scaling
+    if mode === :maxabs
+        return max(1e-12, maximum(abs, series))
+    elseif mode === :std
+        return max(1e-12, std(series))
+    else
+        error("Unsupported scaling mode $(mode)")
+    end
+end
+
+function build_truth_per_well_all(res, config)
     wells = res.wells.wells
     @assert !isempty(wells) "В результате симуляции не найдено скважин"
     t_true = Float64.(res.time)
@@ -138,19 +159,20 @@ function build_truth_per_well_all(res)
 
     for w in ALL_WELLS
         wres = wells[w]
-        qk, use_abs = pick_qoi_key(wres)
-        @assert qk != :missing "У скважины $w нет подходящих QOI (:orat/:orate/:qo/:oil/:wrat/:grat/:lrat)."
+        qk, use_abs = select_well_qoi(wres, config)
+        @assert qk != :missing "У скважины $w нет данных для $(config.label)."
         v = Float64.(wres[qk])
         @assert length(v) == length(t_true) "Длина QOI для $w не равна длине времени"
         truth_by[w] = use_abs ? abs.(v) : v
         qkey_by[w]  = (qk, use_abs)
-        scale_by[w] = max(1e-12, maximum(abs.(truth_by[w])))
+        scale_by[w] = well_series_scale(truth_by[w], config)
     end
     return t_true, truth_by, ALL_WELLS, qkey_by, scale_by
 end
 
+
 t_true, q_true_map, ALL_WELLS, QOI_PER_WELL, Q_SCALE_PER_WELL =
-    build_truth_per_well_all(res_true)
+    build_truth_per_well_all(res_true, WELL_QOI_CONFIG)
 @assert !isempty(ALL_WELLS)
 
 N_W   = length(ALL_WELLS)
@@ -466,7 +488,7 @@ end
 # 10) (Опционально) Визуализация (с расширенными подписями)
 # ---------------------------
 if PLOT
-    title_prefix = "Модель: $(MODEL_NAME) | QOI: дебиты | Подбираем: пористость (PORO)"
+    title_prefix = "Модель: $(MODEL_NAME) | QOI: $(QOI_BASIS) | Подбираем: пористость (PORO)"
     fig1 = Figure(size=(900, 320))
     ax1  = Axis(fig1[1,1], title=title_prefix * " — Loss vs iteration", xlabel="iteration", ylabel="loss")
     lines!(ax1, 1:length(result.losses), result.losses)
@@ -481,7 +503,7 @@ if PLOT
     fig3 = Figure(size=(1100, 380))
     grid = fig3[1,1] = GridLayout()
     for (i, w) in enumerate(show_wells)
-        ax = Axis(grid[1, i], title=String(w) * " — " * title_prefix, xlabel="report step", ylabel="rate")
+        ax = Axis(grid[1, i], title=String(w) * " — " * title_prefix, xlabel="report step", ylabel=QOI_BASIS)
         qT = q_true_map[w]; qF = q_fit_map[w]
         Kp = min(length(qT), length(qF))
         lines!(ax, 1:Kp, qT[1:Kp], label="truth")
