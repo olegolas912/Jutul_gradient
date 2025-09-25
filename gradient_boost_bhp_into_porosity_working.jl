@@ -18,16 +18,22 @@ using CUDA
 # ---------------------------
 # CONFIG / META (для подписей и имён файлов)
 # ---------------------------
-MODEL_NAME   = "SPE1"
-MODEL_PATH = "/home/oleg/tnav_models/SPE1_300"
-QOI_BASIS    = "debites_well_rates" # "дебиты"
-TARGET_PARAM = "PORO"
-ARTIFACT_TAG = "model=$(MODEL_NAME)__qoi=$(QOI_BASIS)__target=$(TARGET_PARAM)"
+const MODEL_NAME = "EGG"
+const WELL_QOI_CONFIG = (
+    label = "bhp_well_pressures",
+    selectors = (
+        (; key = :bhp, use_abs = false),
+    ),
+    scaling = :maxabs,
+)
+const QOI_BASIS = WELL_QOI_CONFIG.label
+const TARGET_PARAM = "PORO"
+const ARTIFACT_TAG = "model=$(MODEL_NAME)__qoi=$(QOI_BASIS)__target=$(TARGET_PARAM)"
 
 # ---------------------------
 # Замеры времени (long-формат, как было)
 # ---------------------------
-TimingRow = NamedTuple{(:label, :iteration, :seconds), Tuple{String, Int, Float64}}
+const TimingRow = NamedTuple{(:label, :iteration, :seconds), Tuple{String, Int, Float64}}
 
 @inline function push_timing!(rows::Vector{TimingRow}, label::String, iteration::Int, seconds::Float64)
     push!(rows, (label=label, iteration=iteration, seconds=seconds))
@@ -37,7 +43,7 @@ end
 # ---------------------------
 # Плоские счётчики прогонов
 # ---------------------------
-RUN_CNT = Dict{Symbol, Int}(
+const RUN_CNT = Dict{Symbol, Int}(
     :forward_truth => 0,
     :forward_eval  => 0,
     :backward_eval => 0,
@@ -68,7 +74,7 @@ end
 # ---------------------------
 # Пользовательские флаги
 # ---------------------------
-USE_COARSE      = false
+USE_COARSE      = true
 COARSE_SHAPE    = (20, 20, 3)
 USE_FIRST_STEPS = true
 N_STEPS_TO_USE  = 2
@@ -86,7 +92,7 @@ STEP_TABLE_CSV_PATH   = joinpath(OUTDIR, "timing_steps__$(ARTIFACT_TAG).csv")
 # ---------------------------
 # 0) NORNE + базовый кейс (единожды)
 # ---------------------------
-data_pth = joinpath(("$MODEL_PATH"), "$MODEL_NAME.DATA")
+data_pth = joinpath(GeoEnergyIO.test_input_file_path("EGG"), "EGG.DATA")
 @assert isfile(data_pth) "Файл кейса не найден: $data_pth"
 data_raw  = parse_data_file(data_pth)
 
@@ -105,7 +111,7 @@ end
 BASE_CASE = setup_case_from_data_file(data_raw) |> slice_steps |> coarse_case
 
 # Базовый прогон (truth) на CUDA
-SIMULATOR_ARGS = (
+const SIMULATOR_ARGS = (
     output_substates = true,
     linear_solver_backend = :cuda,
     precond = :ilu0,
@@ -119,13 +125,27 @@ RUN_CNT[:forward_truth] += 1
 # ---------------------------
 # 1) Истинные ряды QOI и масштабы per-well
 # ---------------------------
-function pick_qoi_key(wres)::Tuple{Symbol,Bool}
-    for k in (:orat,); haskey(wres, k) && return (k, false); end
-    for k in (:wrat, :grat, :lrat);      haskey(wres, k) && return (k, true);  end
-    return (:missing, true)
+@inline function select_well_qoi(wres, config)::Tuple{Symbol,Bool}
+    for sel in config.selectors
+        key = sel.key
+        haskey(wres, key) || continue
+        return (key, sel.use_abs)
+    end
+    return (:missing, false)
 end
 
-function build_truth_per_well_all(res)
+@inline function well_series_scale(series::AbstractVector{<:Real}, config)::Float64
+    mode = config.scaling
+    if mode === :maxabs
+        return max(1e-12, maximum(abs, series))
+    elseif mode === :std
+        return max(1e-12, std(series))
+    else
+        error("Unsupported scaling mode $(mode)")
+    end
+end
+
+function build_truth_per_well_all(res, config)
     wells = res.wells.wells
     @assert !isempty(wells) "В результате симуляции не найдено скважин"
     t_true = Float64.(res.time)
@@ -138,19 +158,20 @@ function build_truth_per_well_all(res)
 
     for w in ALL_WELLS
         wres = wells[w]
-        qk, use_abs = pick_qoi_key(wres)
-        @assert qk != :missing "У скважины $w нет подходящих QOI (:orat/:orate/:qo/:oil/:wrat/:grat/:lrat)."
+        qk, use_abs = select_well_qoi(wres, config)
+        @assert qk != :missing "У скважины $w нет данных для $(config.label)."
         v = Float64.(wres[qk])
         @assert length(v) == length(t_true) "Длина QOI для $w не равна длине времени"
         truth_by[w] = use_abs ? abs.(v) : v
         qkey_by[w]  = (qk, use_abs)
-        scale_by[w] = max(1e-12, maximum(abs.(truth_by[w])))
+        scale_by[w] = well_series_scale(truth_by[w], config)
     end
     return t_true, truth_by, ALL_WELLS, qkey_by, scale_by
 end
 
+
 t_true, q_true_map, ALL_WELLS, QOI_PER_WELL, Q_SCALE_PER_WELL =
-    build_truth_per_well_all(res_true)
+    build_truth_per_well_all(res_true, WELL_QOI_CONFIG)
 @assert !isempty(ALL_WELLS)
 
 N_W   = length(ALL_WELLS)
@@ -221,12 +242,12 @@ case_with_poro_vec(poro_vec::AbstractVector{<:Real}) =
 _loss_acc = Ref(0.0)
 
 # --- Вспомогательное состояние для пер-шагового времени при adjoint-оценке
-_IN_TIMED_EVAL      = Ref(false)
-_CALL_COUNTER       = Ref(0)
-_LAST_NS            = Ref{UInt64}(0)
-_CURR_FORWARD_VEC   = Ref(Vector{Float64}())
-FORWARD_BY_ITER     = Vector{Vector{Float64}}()  # список векторов (по шагам) для каждой итерации
-TOTAL_EVAL_SECS     = Float64[]                  # total (forward+backward) на итерацию
+const _IN_TIMED_EVAL      = Ref(false)
+const _CALL_COUNTER       = Ref(0)
+const _LAST_NS            = Ref{UInt64}(0)
+const _CURR_FORWARD_VEC   = Ref(Vector{Float64}())
+const FORWARD_BY_ITER     = Vector{Vector{Float64}}()  # список векторов (по шагам) для каждой итерации
+const TOTAL_EVAL_SECS     = Float64[]                  # total (forward+backward) на итерацию
 
 function _start_eval_timing!(nsteps::Int)
     _IN_TIMED_EVAL[] = true
@@ -465,7 +486,7 @@ end
 # 10) (Опционально) Визуализация (с расширенными подписями)
 # ---------------------------
 if PLOT
-    title_prefix = "Модель: $(MODEL_NAME) | QOI: дебиты | Подбираем: пористость (PORO)"
+    title_prefix = "Модель: $(MODEL_NAME) | QOI: $(QOI_BASIS) | Подбираем: пористость (PORO)"
     fig1 = Figure(size=(900, 320))
     ax1  = Axis(fig1[1,1], title=title_prefix * " — Loss vs iteration", xlabel="iteration", ylabel="loss")
     lines!(ax1, 1:length(result.losses), result.losses)
@@ -480,7 +501,7 @@ if PLOT
     fig3 = Figure(size=(1100, 380))
     grid = fig3[1,1] = GridLayout()
     for (i, w) in enumerate(show_wells)
-        ax = Axis(grid[1, i], title=String(w) * " — " * title_prefix, xlabel="report step", ylabel="rate")
+        ax = Axis(grid[1, i], title=String(w) * " — " * title_prefix, xlabel="report step", ylabel=QOI_BASIS)
         qT = q_true_map[w]; qF = q_fit_map[w]
         Kp = min(length(qT), length(qF))
         lines!(ax, 1:Kp, qT[1:Kp], label="truth")

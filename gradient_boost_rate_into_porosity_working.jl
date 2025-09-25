@@ -1,10 +1,7 @@
 #############################
 # NORNE_NOHYST: adjoint-GD по поячеечной PORO
-# Версия с расширенными метриками времени и счётчиками прогонов.
-# - PORO строго по пути [:model][:porosity]
-# - Градиент читается из grad_dict[:model][:porosity]
-# - Пер-шаговый учёт forward-времени при adjoint-оценке; backward распределяется равномерно
-# - Названия артефактов включают модель, QOI и подбираемый параметр
+# Версия с логичным CSV: строка = итерация GD (nrounds строк)
+# + детальный CSV по схеме "итерация × временной шаг"
 #############################
 
 using Jutul
@@ -18,15 +15,16 @@ using CUDA
 # ---------------------------
 # CONFIG / META (для подписей и имён файлов)
 # ---------------------------
-const MODEL_NAME   = "EGG"
-const QOI_BASIS    = "debites_well_rates" # "дебиты"
-const TARGET_PARAM = "PORO"
-const ARTIFACT_TAG = "model=$(MODEL_NAME)__qoi=$(QOI_BASIS)__target=$(TARGET_PARAM)"
+MODEL_NAME   = "SPE1_16x"
+MODEL_PATH   = "/home/oleg/tnav_models/SPE1_300"
+QOI_BASIS    = "debites_well_rates" # "дебиты"
+TARGET_PARAM = "PORO"
+ARTIFACT_TAG = "model=$(MODEL_NAME)__qoi=$(QOI_BASIS)__target=$(TARGET_PARAM)"
 
 # ---------------------------
 # Замеры времени (long-формат, как было)
 # ---------------------------
-const TimingRow = NamedTuple{(:label, :iteration, :seconds), Tuple{String, Int, Float64}}
+TimingRow = NamedTuple{(:label, :iteration, :seconds), Tuple{String, Int, Float64}}
 
 @inline function push_timing!(rows::Vector{TimingRow}, label::String, iteration::Int, seconds::Float64)
     push!(rows, (label=label, iteration=iteration, seconds=seconds))
@@ -36,7 +34,7 @@ end
 # ---------------------------
 # Плоские счётчики прогонов
 # ---------------------------
-const RUN_CNT = Dict{Symbol, Int}(
+RUN_CNT = Dict{Symbol, Int}(
     :forward_truth => 0,
     :forward_eval  => 0,
     :backward_eval => 0,
@@ -46,19 +44,45 @@ const RUN_CNT = Dict{Symbol, Int}(
 )
 
 # ---------------------------
-# Таблица "шаги × типы времени" (wide-формат)
+# Итерационный CSV (главный) и детальный CSV (опциональный)
 # ---------------------------
-function write_step_timing_table_csv(path::AbstractString;
-                                     t_report::Vector{Float64},
-                                     fwd_mean::Vector{Float64},
-                                     bwd_mean::Vector{Float64},
-                                     total_mean::Vector{Float64})
-    @assert length(t_report) == length(fwd_mean) == length(bwd_mean) == length(total_mean)
+function write_iter_timing_table_csv(path::AbstractString;
+                                     total_eval_secs::Vector{Float64},
+                                     forward_by_iter::Vector{Vector{Float64}},
+                                     losses::Vector{Float64},
+                                     poro_means::Vector{Float64},
+                                     nsteps::Int)
+    @assert length(total_eval_secs) == length(forward_by_iter) == length(losses) == length(poro_means)
     open(path, "w") do io
-        println(io, "step_index,t_report,forward_eval_mean_sec,backward_eval_mean_sec,total_eval_mean_sec")
-        for i in eachindex(t_report)
-            @printf(io, "%d,%.9f,%.6f,%.6f,%.6f\n",
-                    i, t_report[i], fwd_mean[i], bwd_mean[i], total_mean[i])
+        println(io, "iteration,loss,mean_poro,forward_total_sec,backward_total_sec,total_eval_sec,forward_mean_per_step_sec,backward_mean_per_step_sec,nsteps")
+        for k in eachindex(total_eval_secs)
+            fsum = sum(forward_by_iter[k])
+            bsum = max(0.0, total_eval_secs[k] - fsum)
+            fmean = fsum / nsteps
+            bmean = bsum / nsteps
+            @printf(io, "%d,%.9g,%.9g,%.6f,%.6f,%.6f,%.6f,%.6f,%d\n",
+                    k, losses[k], poro_means[k], fsum, bsum, fsum + bsum, fmean, bmean, nsteps)
+        end
+    end
+    return nothing
+end
+
+function write_per_iter_step_timing_csv(path::AbstractString,
+                                        forward_by_iter::Vector{Vector{Float64}},
+                                        total_eval_secs::Vector{Float64})
+    @assert length(forward_by_iter) == length(total_eval_secs)
+    open(path, "w") do io
+        println(io, "iteration,step_index,forward_sec,backward_sec,total_sec")
+        for k in eachindex(forward_by_iter)
+            fwd = forward_by_iter[k]
+            nsteps = length(fwd)
+            fsum = sum(fwd)
+            bwd_total = max(0.0, total_eval_secs[k] - fsum)
+            bwd = fill(bwd_total / nsteps, nsteps)
+            for i in 1:nsteps
+                total = fwd[i] + bwd[i]
+                @printf(io, "%d,%d,%.6f,%.6f,%.6f\n", k, i, fwd[i], bwd[i], total)
+            end
         end
     end
     return nothing
@@ -67,10 +91,10 @@ end
 # ---------------------------
 # Пользовательские флаги
 # ---------------------------
-USE_COARSE      = true
+USE_COARSE      = false
 COARSE_SHAPE    = (20, 20, 3)
 USE_FIRST_STEPS = true
-N_STEPS_TO_USE  = 2
+N_STEPS_TO_USE  = 2  # ограничение числа временных шагов внутри одной adjoint-оценки
 
 PLOT          = false
 SAVE_TIMINGS  = true
@@ -80,12 +104,15 @@ if PLOT
     using GLMakie
 end
 
-STEP_TABLE_CSV_PATH   = joinpath(OUTDIR, "timing_steps__$(ARTIFACT_TAG).csv")
+# Основной (логичный) CSV по итерациям градиентного спуска
+ITER_TABLE_CSV_PATH     = joinpath(OUTDIR, "timing_iters__$(ARTIFACT_TAG).csv")
+# Детальный CSV: итерация × шаг времени (для углубленного анализа, опционально)
+STEP_ITER_CSV_PATH      = joinpath(OUTDIR, "timing_steps_per_iter__$(ARTIFACT_TAG).csv")
 
 # ---------------------------
 # 0) NORNE + базовый кейс (единожды)
 # ---------------------------
-data_pth = joinpath(GeoEnergyIO.test_input_file_path("EGG"), "EGG.DATA")
+data_pth = joinpath(("$MODEL_PATH"), "$MODEL_NAME.DATA")
 @assert isfile(data_pth) "Файл кейса не найден: $data_pth"
 data_raw  = parse_data_file(data_pth)
 
@@ -104,7 +131,7 @@ end
 BASE_CASE = setup_case_from_data_file(data_raw) |> slice_steps |> coarse_case
 
 # Базовый прогон (truth) на CUDA
-const SIMULATOR_ARGS = (
+SIMULATOR_ARGS = (
     output_substates = true,
     linear_solver_backend = :cuda,
     precond = :ilu0,
@@ -119,7 +146,7 @@ RUN_CNT[:forward_truth] += 1
 # 1) Истинные ряды QOI и масштабы per-well
 # ---------------------------
 function pick_qoi_key(wres)::Tuple{Symbol,Bool}
-    for k in (:orat, :orate, :qo, :oil); haskey(wres, k) && return (k, false); end
+    for k in (:orat,); haskey(wres, k) && return (k, false); end
     for k in (:wrat, :grat, :lrat);      haskey(wres, k) && return (k, true);  end
     return (:missing, true)
 end
@@ -211,8 +238,10 @@ function dict_with_poro_vec(poro_vec::AbstractVector{<:Real})
     return dopt
 end
 
-case_with_poro_vec(poro_vec::AbstractVector{<:Real}) =
-    dict_with_poro_vec(poro_vec).setup_function(dict_with_poro_vec(poro_vec).parameters, missing)
+function case_with_poro_vec(poro_vec::AbstractVector{<:Real})
+    dopt = dict_with_poro_vec(poro_vec)
+    return dopt.setup_function(dopt.parameters, missing)
+end
 
 # ---------------------------
 # 3) Adjoint objective (пер-скважинная нормированная MSE)
@@ -220,12 +249,12 @@ case_with_poro_vec(poro_vec::AbstractVector{<:Real}) =
 _loss_acc = Ref(0.0)
 
 # --- Вспомогательное состояние для пер-шагового времени при adjoint-оценке
-const _IN_TIMED_EVAL      = Ref(false)
-const _CALL_COUNTER       = Ref(0)
-const _LAST_NS            = Ref{UInt64}(0)
-const _CURR_FORWARD_VEC   = Ref(Vector{Float64}())
-const FORWARD_BY_ITER     = Vector{Vector{Float64}}()  # список векторов (по шагам) для каждой итерации
-const TOTAL_EVAL_SECS     = Float64[]                  # total (forward+backward) на итерацию
+_IN_TIMED_EVAL      = Ref(false)
+_CALL_COUNTER       = Ref(0)
+_LAST_NS            = Ref{UInt64}(0)
+_CURR_FORWARD_VEC   = Ref(Vector{Float64}())
+FORWARD_BY_ITER     = Vector{Vector{Float64}}()  # список векторов (по шагам) для каждой итерации
+TOTAL_EVAL_SECS     = Float64[]                  # total (forward+backward) на итерацию
 
 function _start_eval_timing!(nsteps::Int)
     _IN_TIMED_EVAL[] = true
@@ -253,7 +282,7 @@ function per_well_objective_report(m, s, dt, step_info, forces)
     if _IN_TIMED_EVAL[]
         now = time_ns()
         if _CALL_COUNTER[] ≥ 1
-            prev_idx = _CALL_COUNTER[] # время между (prev_idx) и текущим вызовом — это вклад в prev_idx
+            prev_idx = _CALL_COUNTER[]
             if prev_idx ≤ length(_CURR_FORWARD_VEC[])
                 _CURR_FORWARD_VEC[][prev_idx] += 1e-9 * (now - _LAST_NS[])
             end
@@ -370,6 +399,8 @@ start_poro = clamp.(0.7 .* PORO_TEMPLATE, 1e-6, 0.999)
 train_start = time_ns()
 result = train_porosity_adjoint!(start_poro; eta=1e-2, nrounds=4, poro_min=1e-6, poro_max=0.999)
 train_elapsed = 1e-9 * (time_ns() - train_start)
+
+# аккумулируем тайминги
 append!(timing_rows, result.timings)
 push_timing!(timing_rows, "train_total", 0, train_elapsed)
 
@@ -424,44 +455,37 @@ println("Артефакты сохраняются в: $OUTDIR")
 println("===============================================")
 
 # ---------------------------
-# 9) Wide-таблица времени: шаги × типы времени (по adjoint-оценкам)
+# 9) CSV-отчёты: по итерациям (главный) и детальный per-iter × step (доп.)
 # ---------------------------
-# fwd_per_iter: список векторов длины nsteps; total_eval_per_iter — скаляры
 @assert length(FORWARD_BY_ITER) == length(TOTAL_EVAL_SECS) == length(result.losses)
-
 nsteps = length(t_true)
 @assert all(length(v) == nsteps for v in FORWARD_BY_ITER)
 
-# средние по forward-времени на шаг
-fwd_mean = [ mean(getindex.(FORWARD_BY_ITER, i)) for i in 1:nsteps ]
-
-# оценка backward: на каждой итерации берём (total - sum(forward)), делим поровну по шагам
-bwd_per_step_iters = Vector{Vector{Float64}}(undef, length(TOTAL_EVAL_SECS))
-for k in eachindex(TOTAL_EVAL_SECS)
-    fsum = sum(FORWARD_BY_ITER[k])
-    bwd_total = max(0.0, TOTAL_EVAL_SECS[k] - fsum)
-    bwd_per_step_iters[k] = fill(bwd_total / nsteps, nsteps)
-end
-bwd_mean = [ mean(getindex.(bwd_per_step_iters, i)) for i in 1:nsteps ]
-
-total_mean = [ fwd_mean[i] + bwd_mean[i] for i in 1:nsteps ]
-
 if SAVE_TIMINGS
-    write_step_timing_table_csv(STEP_TABLE_CSV_PATH;
-        t_report = t_true, fwd_mean=fwd_mean,
-        bwd_mean=bwd_mean, total_mean=total_mean)
+    # Главный CSV: строка = итерация GD
+    write_iter_timing_table_csv(ITER_TABLE_CSV_PATH;
+        total_eval_secs = TOTAL_EVAL_SECS,
+        forward_by_iter = FORWARD_BY_ITER,
+        losses = result.losses,
+        poro_means = result.poro_mean,
+        nsteps = nsteps)
 
-    # Итоговые агрегаты времени (для COUNTERS_CSV)
+    # Детальный CSV: по всем итерациям и временным шагам
+    write_per_iter_step_timing_csv(STEP_ITER_CSV_PATH, FORWARD_BY_ITER, TOTAL_EVAL_SECS)
+
+    # Итоговые агрегаты времени (для COUNTERS_CSV-подобного использования)
     extra = Dict{Symbol,Float64}(
         :truth_forward_secs => sum(r.seconds for r in timing_rows if r.label == "truth_forward"),
         :final_forward_secs => sum(r.seconds for r in timing_rows if r.label == "final_forward"),
         :train_total_secs   => sum(r.seconds for r in timing_rows if r.label == "train_total"),
         :adjoint_eval_mean_secs => mean(TOTAL_EVAL_SECS),
     )
+    # Можно распечатать краткий отчёт:
+    @info "Timing summary: truth=$(extra[:truth_forward_secs])s, train_total=$(extra[:train_total_secs])s, final=$(extra[:final_forward_secs])s, adjoint_mean=$(extra[:adjoint_eval_mean_secs])s"
 end
 
 # ---------------------------
-# 10) (Опционально) Визуализация (с расширенными подписями)
+# 10) (Опционально) Визуализация
 # ---------------------------
 if PLOT
     title_prefix = "Модель: $(MODEL_NAME) | QOI: дебиты | Подбираем: пористость (PORO)"
