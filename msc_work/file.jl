@@ -1,14 +1,11 @@
-############### TOP-LEVEL IMPORTS ###############
 using JutulDarcy
 using Jutul
 using Random
 using Statistics
 using GLMakie
 
-# Базовые юниты из Jutul/JutulDarcy
-Darcy, bar, kg, meter, day_unit = si_units(:darcy, :bar, :kilogram, :meter, :day) # OK по докам
+Darcy, bar, kg, meter, day_unit = si_units(:darcy, :bar, :kilogram, :meter, :day)
 
-############### СЕТКА/ГЕОМЕТРИЯ ###############
 nx, ny, nz = 50, 50, 1
 Lx, Ly, Lz = 100.0, 100.0, 1.0
 cart_dims   = (nx, ny, nz)
@@ -16,27 +13,20 @@ physical_sz = (Lx, Ly, Lz) .* meter
 g    = CartesianMesh(cart_dims, physical_sz)
 nc  = prod(cart_dims)
 
-# Если пористость ещё не определена где-то раньше, возьмём 0.2
 poro = @isdefined(poro) ? poro : fill(0.2, nc)
 
-# Индексации
 cell_index(i, j; nx=nx) = (j-1)*nx + i
 left_cells  = [cell_index(1,  j)   for j in 1:ny]
 right_cells = [cell_index(nx, j)   for j in 1:ny]
 
-############### НАСТРОЙКА ФИЗИКИ ###############
 phases = (LiquidPhase(), VaporPhase())
 rhoLS  = 1000.0 * kg/meter^3
 rhoGS  = 100.0  * kg/meter^3
 sys = ImmiscibleSystem(phases, reference_densities=[rhoLS, rhoGS])
 
-# ВЯЗКОСТИ (Па·с)
 μL = 1.0e-3
 μG = 1.0e-5
 
-############### ФУНКЦИИ ДЛЯ ПРОНИЦАЕМОСТИ И СЛУЧАЯ ###############
-# ДОЛЖНА существовать у вас:
-# k_from_zones(theta)::Vector{Float64}  # длина = nc, единицы: м^2
 
 function k_from_zones(theta::AbstractMatrix{<:Real})
     sx, sy = size(theta)
@@ -80,41 +70,34 @@ end
 function make_case(k_m2::Vector{Float64})
     @assert length(k_m2) == nc "Длина k_m2 должна равняться числу ячеек"
 
-    # 1) Домен
     domain = reservoir_domain(g;
         permeability = k_m2,
         porosity     = poro
     )
 
-    # 2) Модель + параметры
     model, parameters = setup_reservoir_model(domain, sys)
 
-    # 3) Вязкости как параметры (по фазам и ячейкам)
     parameters[:Reservoir][:PhaseViscosities] = [fill(μL, nc) fill(μG, nc)]'
 
-    # 4) Начальное состояние
     state0 = setup_reservoir_state(model;
         Pressure    = 100.0 * bar,
         Saturations = [1.0, 0.0]
     )
 
-    # 5) Граничные условия по давлению (левая/правая грани)
-    hL, hR = 102.0, 100.0    # м водяного столба
-    ρg = 9.81e3               # Па/м
+    hL, hR = 102.0, 100.0
+    ρg = 9.81e3
     pL = hL * ρg
     pR = hR * ρg
     bcL = flow_boundary_condition(left_cells,  domain, pL)
     bcR = flow_boundary_condition(right_cells, domain, pR)
     forces = setup_reservoir_forces(model, bc = vcat(bcL, bcR))
 
-    # 6) Временные шаги
     nstep = 60
     dt = fill(1.0 * day_unit, nstep)
 
     return JutulCase(model, dt, forces; state0 = state0, parameters = parameters)
 end
 
-############### «СКВАЖИНЫ»/НАБЛЮДАТЕЛИ (ячейки) ###############
 Random.seed!(42)
 theta_true = [log(50.0 + 20.0*sin(π*i/5)*cos(π*j/5)) for i=1:5, j=1:5] # мД (лог-шкала)
 k_true = k_from_zones(theta_true)  # в м^2, длина = nc
@@ -125,14 +108,11 @@ obs_ij = [(5,5),(25,5),(45,5),
           (5,45),(25,45)]
 obs_cells = [cell_idx(i,j) for (i,j) in obs_ij]
 
-############### «ИСТИНА» И МОДЕЛИРОВАНИЕ ###############
 case_true = make_case(k_true)
 
-# OK-вызов: (case::JutulCase)
 res_true = simulate_reservoir(case_true)
 wd_true, states_true, time_true = res_true
 
-# FIX: Давление берём как [:Pressure]
 p_series_true = [states_true[t][:Pressure][obs_cells] for t in 1:length(states_true)]
 
 # Шум в тренировочной части (дни 1–40)
