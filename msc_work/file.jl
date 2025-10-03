@@ -1,4 +1,4 @@
-# === History matching PERM по дебитам через adjoint + L-BFGS (как в доках) ===
+# === History matching PERM по дебитам через adjoint + L-BFGS ===
 using Jutul, JutulDarcy
 using GeoEnergyIO
 using Statistics, Printf
@@ -59,31 +59,41 @@ function F_perm(prm::AbstractDict, step_info = missing)
     return setup_case_from_data_file(data_c)
 end
 
-# -------------------- 3) Начальная точка: берем PERMX из DATA --------------------
+# -------------------- 3) Начальная точка: берём PERMX/PERMY/PERMZ из DATA и их меняем --------------------
 # Значения в DATA у JutulDarcy — в СИ (м^2).
-# -------------------- 3) Начальная точка: берём PERMX/PERMY/PERMZ из DATA --------------------
-# Если PERMY/PERMZ отсутствуют в DATA, подставляем PERMX.
-perm0x_SI = vec(data["GRID"]["PERMX"])
-perm0y_SI = vec(data["GRID"]["PERMY"])
-perm0z_SI = vec(data["GRID"]["PERMZ"])
+md_per_SI = 1000.0 / si_unit(:darcy)  # м² -> мДарси
 
-prm0 = Dict(
-    "kx" => copy(perm0x_SI),
-    "ky" => copy(perm0y_SI),
-    "kz" => copy(perm0z_SI),
-)
+perm_true_x_SI = vec(data["GRID"]["PERMX"])
+perm_true_y_SI = vec(data["GRID"]["PERMY"])
+perm_true_z_SI = vec(data["GRID"]["PERMZ"])
+
+# Задаём «плохой» старт в мДарси:
+kx_start_mD = 120.0   # << истина 500
+ky_start_mD = 80.0    # << истина 500
+kz_start_mD = 15.0    # << истина 50
+
+# Конвертируем в СИ и заполняем все ячейки константой
+kx0_SI = fill(kx_start_mD / md_per_SI, length(perm_true_x_SI))
+ky0_SI = fill(ky_start_mD / md_per_SI, length(perm_true_y_SI))
+kz0_SI = fill(kz_start_mD / md_per_SI, length(perm_true_z_SI))
+
+# Стартовый словарь параметров для оптимизации
+prm0 = Dict("kx" => kx0_SI, "ky" => ky0_SI, "kz" => kz0_SI)
+
+# Быстрый отчёт, чтобы видеть реальный старт (в мД)
+@info @sprintf("START (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_start_mD, ky_start_mD, kz_start_mD)
 
 # -------------------- 4) Настройка оптимизации с L-BFGS --------------------
 dprm = setup_reservoir_dict_optimization(prm0, F_perm)
 
 # Полная свобода по всем ячейкам и направлениям (относительные коробочные ограничения)
 for p in ("kx", "ky", "kz")
-    free_optimization_parameter!(dprm, p; rel_min = 0.2, rel_max = 5.0)
+    free_optimization_parameter!(dprm, p; rel_min = 0.2, rel_max = 20.0)
 end
 
 # -------------------- 5) Запуск оптимизации --------------------
 Random.seed!(0)
-perm_tuned = optimize_reservoir(dprm, rates_mismatch)
+perm_tuned = optimize_reservoir(dprm, rates_mismatch;max_it = 50)
 
 # dprm.history.val содержит историю значений цели по итерациям LBFGS
 @info "Оптимизация завершена."
