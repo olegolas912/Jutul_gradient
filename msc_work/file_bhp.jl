@@ -4,7 +4,6 @@ using GeoEnergyIO
 using Statistics, Printf
 using Random
 
-const RATE_SCALE = 1.0 / si_unit(:day)
 const BHP_SCALE = si_unit(:bar)
 
 # -------------------- 0) Вводные --------------------
@@ -16,47 +15,30 @@ data = GeoEnergyIO.parse_data_file(datafile)
 case_truth = setup_case_from_data_file(data)
 res_truth  = simulate_reservoir(case_truth; info_level=-1)
 
-# Скважины и наблюдения (истина) по дебитам
-wells = [:PROD]
-obs_oil = Dict(w => collect(res_truth.wells[w][:orat]) ./ RATE_SCALE for w in wells)
-obs_wat = Dict(w => collect(res_truth.wells[w][:wrat]) ./ RATE_SCALE for w in wells)
-obs_bhp = Dict(w => collect(res_truth.wells[w][:bhp]) ./ BHP_SCALE for w in wells)
+# Скважины и наблюдения (истина) по дебитам/давлениям
+wells = [:INJ, :PROD]
+obs_oil = Dict(w => collect(res_truth.wells[w][:orat]) for w in wells)
+obs_wat = Dict(w => collect(res_truth.wells[w][:wrat]) for w in wells)
+obs_bhp = Dict(w => collect(res_truth.wells[w][:bhp]) for w in wells)
 
-# Временные шаги (используем фактическое время модели)
-step_times = collect(res_truth.time)
-total_time = step_times[end]
+# Временные шаги (как в доках: используем cumsum(dt) + шаг по ближайшему времени)
+step_times  = cumsum(case_truth.dt)
+total_time  = step_times[end]
 
-const RATE_REL_FLOOR = 1.0
-const RATE_WEIGHT = 1.0e2
-const BHP_WEIGHT = 1.0e3
-const PERM_LOWER_SCALE = 0.1
-const PERM_UPPER_SCALE = 1.05
-
-
-# -------------------- 1) Целевая функция (MSE по дебитам) --------------------
+# -------------------- 1) Целевая функция (MSE по забойному давлению) --------------------
 function rates_mismatch(model, state, dt, step_info, forces)
+    # время на конце текущего шага
     t = step_info[:time] + dt
+    # ближайший отчетный шаг
     step = searchsortedlast(step_times, t)
     step = clamp(step, 1, length(step_times))
 
     s = 0.0
     for w in wells
-        qo = JutulDarcy.compute_well_qoi(model, state, forces, w, :orat) / RATE_SCALE
-        qw = JutulDarcy.compute_well_qoi(model, state, forces, w, :wrat) / RATE_SCALE
-        qb = JutulDarcy.compute_well_qoi(model, state, forces, w, :bhp) / BHP_SCALE
-
-        qoref = obs_oil[w][step]
-        qwref = obs_wat[w][step]
-        qbref = obs_bhp[w][step]
-
-        err_o = (qo - qoref) / max(abs(qoref), RATE_REL_FLOOR)
-        err_w = (qw - qwref) / max(abs(qwref), RATE_REL_FLOOR)
-        err_b = qb - qbref
-
-        s += RATE_WEIGHT * 0.5 * (err_o^2 + err_w^2)
-        s += BHP_WEIGHT * err_b^2
+        qb = JutulDarcy.compute_well_qoi(model, state, forces, w, :bhp)
+        err_bhp = (qb - obs_bhp[w][step]) / BHP_SCALE
+        s += err_bhp^2
     end
-
     return (dt / total_time) * s / length(wells)
 end
 
@@ -67,9 +49,13 @@ function F_perm(prm::AbstractDict, step_info = missing)
     data_c = deepcopy(data)
     sz = size(data_c["GRID"]["PERMX"])  # например (5,5,1)
 
-    data_c["GRID"]["PERMX"] = reshape(prm["kx"], sz)
-    data_c["GRID"]["PERMY"] = reshape(prm["ky"], sz)
-    data_c["GRID"]["PERMZ"] = reshape(prm["kz"], sz)
+    kx = reshape(prm["kx"], sz)
+    ky = reshape(prm["ky"], sz)
+    kz = reshape(prm["kz"], sz)
+
+    data_c["GRID"]["PERMX"] = kx
+    data_c["GRID"]["PERMY"] = ky
+    data_c["GRID"]["PERMZ"] = kz
 
     return setup_case_from_data_file(data_c)
 end
@@ -85,7 +71,7 @@ perm_true_z_SI = vec(data["GRID"]["PERMZ"])
 # Задаём «плохой» старт в мДарси:
 kx_start_mD = 120.0   # << истина 500
 ky_start_mD = 80.0    # << истина 500
-kz_start_mD = 50.0    # берём true kz для стабильности
+kz_start_mD = 15.0    # << истина 50
 
 # Конвертируем в СИ и заполняем все ячейки константой
 kx0_SI = fill(kx_start_mD / md_per_SI, length(perm_true_x_SI))
@@ -98,30 +84,22 @@ prm0 = Dict("kx" => kx0_SI, "ky" => ky0_SI, "kz" => kz0_SI)
 # Быстрый отчёт, чтобы видеть реальный старт (в мД)
 @info @sprintf("START (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_start_mD, ky_start_mD, kz_start_mD)
 
-# -------------------- 4) Настройка оптимизации --------------------
-Random.seed!(0)
+# -------------------- 4) Настройка оптимизации с L-BFGS --------------------
 dprm = setup_reservoir_dict_optimization(prm0, F_perm)
-for (p, vals, init) in zip(
-    ("kx", "ky", "kz"),
-    (perm_true_x_SI, perm_true_y_SI, perm_true_z_SI),
-    (kx0_SI, ky0_SI, kz0_SI),
-)
-    lo = PERM_LOWER_SCALE .* min.(vals, init)
-    hi = PERM_UPPER_SCALE .* max.(vals, init)
-    free_optimization_parameter!(dprm, p; abs_min = lo, abs_max = hi, scaler = :log)
+
+# Полная свобода по всем ячейкам и направлениям (относительные коробочные ограничения)
+for p in ("kx", "ky", "kz")
+    free_optimization_parameter!(dprm, p; rel_min = 0.2, rel_max = 20.0)
 end
 
-perm_tuned = optimize_reservoir(
-    dprm,
-    rates_mismatch;
-    max_it = 120,
-    step_init = 0.1,
-    max_initial_update = 0.2,
-)
+# -------------------- 5) Запуск оптимизации --------------------
+Random.seed!(0)
+perm_tuned = optimize_reservoir(dprm, rates_mismatch;max_it = 50)
 
+# dprm.history.val содержит историю значений цели по итерациям LBFGS
 @info "Оптимизация завершена."
 
-# -------------------- 5) Достаём оценённую проницаемость и переводим в мДарси --------------------
+# -------------------- 6) Достаём оценённую проницаемость и переводим в мДарси --------------------
 kx_SI = perm_tuned["kx"]              # в м^2, длина = Nc
 ky_SI = perm_tuned["ky"]
 kz_SI = perm_tuned["kz"]
@@ -146,4 +124,3 @@ end
 sz = size(data["GRID"]["PERMX"])  # например (5,5,1)
 save_perm_csv("perm_lbfsg_mD.csv", kx_mD, ky_mD, kz_mD, sz)
 @info "Сохранил kx,ky,kz (мДарси) в perm_lbfsg_mD.csv"
-@info @sprintf("TUNED (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_mD[1], ky_mD[1], kz_mD[1])

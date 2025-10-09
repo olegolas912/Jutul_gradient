@@ -5,7 +5,6 @@ using Statistics, Printf
 using Random
 
 const RATE_SCALE = 1.0 / si_unit(:day)
-const BHP_SCALE = si_unit(:bar)
 
 # -------------------- 0) Вводные --------------------
 # Укажи свой путь к SPE1.DATA
@@ -17,21 +16,21 @@ case_truth = setup_case_from_data_file(data)
 res_truth  = simulate_reservoir(case_truth; info_level=-1)
 
 # Скважины и наблюдения (истина) по дебитам
-wells = [:PROD]
+wells = [:INJ, :PROD]
 obs_oil = Dict(w => collect(res_truth.wells[w][:orat]) ./ RATE_SCALE for w in wells)
 obs_wat = Dict(w => collect(res_truth.wells[w][:wrat]) ./ RATE_SCALE for w in wells)
+BHP_SCALE = si_unit(:bar)
 obs_bhp = Dict(w => collect(res_truth.wells[w][:bhp]) ./ BHP_SCALE for w in wells)
 
-# Временные шаги (используем фактическое время модели)
-step_times = collect(res_truth.time)
-total_time = step_times[end]
+# Временные шаги (как в доках: используем cumsum(dt) + шаг по ближайшему времени)
+step_times  = collect(res_truth.time)
+total_time  = step_times[end]
 
-const RATE_REL_FLOOR = 1.0
-const RATE_WEIGHT = 1.0e2
-const BHP_WEIGHT = 1.0e3
+const RATE_REL_FLOOR = 1.0        # см^3/сут для нормировки относительной ошибки
+const RATE_WEIGHT = 1.0e3         # усиливаем вклад дебитов
+const BHP_WEIGHT = 1.0e3         # работаем в барах
 const PERM_LOWER_SCALE = 0.1
-const PERM_UPPER_SCALE = 1.05
-
+const PERM_UPPER_SCALE = 1.1
 
 # -------------------- 1) Целевая функция (MSE по дебитам) --------------------
 function rates_mismatch(model, state, dt, step_info, forces)
@@ -98,9 +97,10 @@ prm0 = Dict("kx" => kx0_SI, "ky" => ky0_SI, "kz" => kz0_SI)
 # Быстрый отчёт, чтобы видеть реальный старт (в мД)
 @info @sprintf("START (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_start_mD, ky_start_mD, kz_start_mD)
 
-# -------------------- 4) Настройка оптимизации --------------------
-Random.seed!(0)
+# -------------------- 4) Настройка оптимизации с L-BFGS --------------------
 dprm = setup_reservoir_dict_optimization(prm0, F_perm)
+
+# Коробочные ограничения по каждой ячейке
 for (p, vals, init) in zip(
     ("kx", "ky", "kz"),
     (perm_true_x_SI, perm_true_y_SI, perm_true_z_SI),
@@ -111,17 +111,20 @@ for (p, vals, init) in zip(
     free_optimization_parameter!(dprm, p; abs_min = lo, abs_max = hi, scaler = :log)
 end
 
+# -------------------- 5) Запуск оптимизации --------------------
+Random.seed!(0)
 perm_tuned = optimize_reservoir(
     dprm,
     rates_mismatch;
-    max_it = 120,
-    step_init = 0.1,
-    max_initial_update = 0.2,
+    max_it = 150,
+    step_init = 1e-2,
+    max_initial_update = 5e-2,
 )
 
+# dprm.history.val содержит историю значений цели по итерациям LBFGS
 @info "Оптимизация завершена."
 
-# -------------------- 5) Достаём оценённую проницаемость и переводим в мДарси --------------------
+# -------------------- 6) Достаём оценённую проницаемость и переводим в мДарси --------------------
 kx_SI = perm_tuned["kx"]              # в м^2, длина = Nc
 ky_SI = perm_tuned["ky"]
 kz_SI = perm_tuned["kz"]
