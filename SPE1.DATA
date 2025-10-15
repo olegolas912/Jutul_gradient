@@ -282,7 +282,7 @@ COMPDAT
 
 WCONPROD
 -- Item #:1	2      3     4	   5  9
-	'PROD' 'OPEN' 'BHP' 10 4* 90 /
+	'PROD' 'OPEN' 'BHP' 1* 4* 90 /
 /
 -- It is stated in Odeh's paper that the maximum oil prod. rate
 -- is 20 000stb per day which explains the choice of value in item 4.
@@ -291,7 +291,7 @@ WCONPROD
 
 WCONINJE
 -- Item #:1	 2	 3	 4	5      6  7
-	'INJ'	'WATER'	'OPEN'	'BHP'	10 1* 110 /
+	'INJ'	'WATER'	'OPEN'	'BHP'	1* 1* 110 /
 /
 -- Stated in Odeh that gas inj. rate (item 5) is 100MMscf per day
 -- BHP upper limit (item 7) should not be exceeding the highest

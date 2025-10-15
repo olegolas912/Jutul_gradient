@@ -8,7 +8,7 @@ const BHP_SCALE = si_unit(:bar)
 
 # -------------------- 0) Вводные --------------------
 # Укажи свой путь к SPE1.DATA
-datafile = joinpath("/media/oleg/E8C0040CC003E024/Tnavigator_models/msc_spe1", "SPE1.DATA")
+datafile = joinpath("/home/oleg/Github/Jutul_gradient/", "SPE1.DATA")
 
 # Загружаем DATA и базовый кейс ("истина" для наблюдений)
 data = GeoEnergyIO.parse_data_file(datafile)
@@ -124,3 +124,9 @@ end
 sz = size(data["GRID"]["PERMX"])  # например (5,5,1)
 save_perm_csv("perm_lbfsg_mD.csv", kx_mD, ky_mD, kz_mD, sz)
 @info "Сохранил kx,ky,kz (мДарси) в perm_lbfsg_mD.csv"
+kx_mean_mD = mean(kx_mD)
+ky_mean_mD = mean(ky_mD)
+kz_mean_mD = mean(kz_mD)
+
+@info @sprintf("TUNED MEAN (мД): kx=%.1f, ky=%.1f, kz=%.1f",
+               kx_mean_mD, ky_mean_mD, kz_mean_mD)

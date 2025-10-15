@@ -1,4 +1,4 @@
-# === History matching PERM по дебитам через adjoint + L-BFGS ===
+# === History matching PERM по дебитам + bhp через adjoint + L-BFGS ===
 using Jutul, JutulDarcy
 using GeoEnergyIO
 using Statistics, Printf
@@ -7,8 +7,7 @@ using Random
 const RATE_SCALE = 1.0 / si_unit(:day)
 
 # -------------------- 0) Вводные --------------------
-# Укажи свой путь к SPE1.DATA
-datafile = joinpath("/media/oleg/E8C0040CC003E024/Tnavigator_models/msc_spe1", "SPE1.DATA")
+datafile = joinpath("/home/oleg/Github/Jutul_gradient/", "SPE1.DATA")
 
 # Загружаем DATA и базовый кейс ("истина" для наблюдений)
 data = GeoEnergyIO.parse_data_file(datafile)
@@ -22,13 +21,13 @@ obs_wat = Dict(w => collect(res_truth.wells[w][:wrat]) ./ RATE_SCALE for w in we
 BHP_SCALE = si_unit(:bar)
 obs_bhp = Dict(w => collect(res_truth.wells[w][:bhp]) ./ BHP_SCALE for w in wells)
 
-# Временные шаги (как в доках: используем cumsum(dt) + шаг по ближайшему времени)
+# Временные шаги
 step_times  = collect(res_truth.time)
 total_time  = step_times[end]
 
 const RATE_REL_FLOOR = 1.0        # см^3/сут для нормировки относительной ошибки
 const RATE_WEIGHT = 1.0e3         # усиливаем вклад дебитов
-const BHP_WEIGHT = 1.0e3         # работаем в барах
+const BHP_WEIGHT = 1.0e3          # работаем в барах
 const PERM_LOWER_SCALE = 0.1
 const PERM_UPPER_SCALE = 1.1
 
@@ -94,13 +93,11 @@ kz0_SI = fill(kz_start_mD / md_per_SI, length(perm_true_z_SI))
 # Стартовый словарь параметров для оптимизации
 prm0 = Dict("kx" => kx0_SI, "ky" => ky0_SI, "kz" => kz0_SI)
 
-# Быстрый отчёт, чтобы видеть реальный старт (в мД)
 @info @sprintf("START (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_start_mD, ky_start_mD, kz_start_mD)
 
 # -------------------- 4) Настройка оптимизации с L-BFGS --------------------
 dprm = setup_reservoir_dict_optimization(prm0, F_perm)
 
-# Коробочные ограничения по каждой ячейке
 for (p, vals, init) in zip(
     ("kx", "ky", "kz"),
     (perm_true_x_SI, perm_true_y_SI, perm_true_z_SI),
@@ -121,11 +118,10 @@ perm_tuned = optimize_reservoir(
     max_initial_update = 5e-2,
 )
 
-# dprm.history.val содержит историю значений цели по итерациям LBFGS
 @info "Оптимизация завершена."
 
 # -------------------- 6) Достаём оценённую проницаемость и переводим в мДарси --------------------
-kx_SI = perm_tuned["kx"]              # в м^2, длина = Nc
+kx_SI = perm_tuned["kx"]              # в м^2
 ky_SI = perm_tuned["ky"]
 kz_SI = perm_tuned["kz"]
 
@@ -146,7 +142,12 @@ function save_perm_csv(path::AbstractString, kx, ky, kz, sz::NTuple{3,Int})
     end
 end
 
-sz = size(data["GRID"]["PERMX"])  # например (5,5,1)
+sz = size(data["GRID"]["PERMX"])
 save_perm_csv("perm_lbfsg_mD.csv", kx_mD, ky_mD, kz_mD, sz)
 @info "Сохранил kx,ky,kz (мДарси) в perm_lbfsg_mD.csv"
-@info @sprintf("TUNED (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_mD[1], ky_mD[1], kz_mD[1])
+kx_mean_mD = mean(kx_mD)
+ky_mean_mD = mean(ky_mD)
+kz_mean_mD = mean(kz_mD)
+
+@info @sprintf("TUNED MEAN (мД): kx=%.1f, ky=%.1f, kz=%.1f",
+               kx_mean_mD, ky_mean_mD, kz_mean_mD)

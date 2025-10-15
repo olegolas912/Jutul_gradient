@@ -5,14 +5,34 @@ using Statistics, Printf
 using Random
 
 const RATE_SCALE = 1.0 / si_unit(:day)
-const BHP_SCALE = si_unit(:bar)
 
 # -------------------- 0) Вводные --------------------
 # Укажи свой путь к SPE1.DATA
-datafile = joinpath("/media/oleg/E8C0040CC003E024/Tnavigator_models/msc_spe1", "SPE1.DATA")
+datafile = joinpath("/home/oleg/Github/Jutul_gradient/", "SPE1.DATA")
 
 # Загружаем DATA и базовый кейс ("истина" для наблюдений)
 data = GeoEnergyIO.parse_data_file(datafile)
+# function relax_rate_limits!(deck::AbstractDict)
+#     steps = deck["SCHEDULE"]["STEPS"]
+#     for step in steps
+#         if haskey(step, "WCONPROD")
+#             for ctrl in step["WCONPROD"]
+#                 ctrl[4] = Inf  # ORAT
+#                 ctrl[5] = Inf  # WRAT
+#                 ctrl[6] = Inf  # GRAT
+#                 ctrl[7] = Inf  # LRAT
+#                 ctrl[8] = Inf  # RESV
+#             end
+#         end
+#         if haskey(step, "WCONINJE")
+#             for ctrl in step["WCONINJE"]
+#                 ctrl[5] = Inf  # RATE
+#             end
+#         end
+#     end
+#     return deck
+# end
+# relax_rate_limits!(data)
 case_truth = setup_case_from_data_file(data)
 res_truth  = simulate_reservoir(case_truth; info_level=-1)
 
@@ -20,15 +40,12 @@ res_truth  = simulate_reservoir(case_truth; info_level=-1)
 wells = [:PROD]
 obs_oil = Dict(w => collect(res_truth.wells[w][:orat]) ./ RATE_SCALE for w in wells)
 obs_wat = Dict(w => collect(res_truth.wells[w][:wrat]) ./ RATE_SCALE for w in wells)
-obs_bhp = Dict(w => collect(res_truth.wells[w][:bhp]) ./ BHP_SCALE for w in wells)
 
 # Временные шаги (используем фактическое время модели)
 step_times = collect(res_truth.time)
 total_time = step_times[end]
 
-const RATE_REL_FLOOR = 1.0
-const RATE_WEIGHT = 1.0e2
-const BHP_WEIGHT = 1.0e3
+const RATE_WEIGHT = 1.0
 const PERM_LOWER_SCALE = 0.1
 const PERM_UPPER_SCALE = 1.05
 
@@ -43,18 +60,14 @@ function rates_mismatch(model, state, dt, step_info, forces)
     for w in wells
         qo = JutulDarcy.compute_well_qoi(model, state, forces, w, :orat) / RATE_SCALE
         qw = JutulDarcy.compute_well_qoi(model, state, forces, w, :wrat) / RATE_SCALE
-        qb = JutulDarcy.compute_well_qoi(model, state, forces, w, :bhp) / BHP_SCALE
 
         qoref = obs_oil[w][step]
         qwref = obs_wat[w][step]
-        qbref = obs_bhp[w][step]
 
-        err_o = (qo - qoref) / max(abs(qoref), RATE_REL_FLOOR)
-        err_w = (qw - qwref) / max(abs(qwref), RATE_REL_FLOOR)
-        err_b = qb - qbref
+        err_o = qo - qoref
+        err_w = qw - qwref
 
         s += RATE_WEIGHT * 0.5 * (err_o^2 + err_w^2)
-        s += BHP_WEIGHT * err_b^2
     end
 
     return (dt / total_time) * s / length(wells)
@@ -130,6 +143,13 @@ md_per_SI = 1000.0 / si_unit(:darcy)  # м^2 -> мДарси
 kx_mD = kx_SI .* md_per_SI
 ky_mD = ky_SI .* md_per_SI
 kz_mD = kz_SI .* md_per_SI
+true_kx_mD = perm_true_x_SI .* md_per_SI
+true_ky_mD = perm_true_y_SI .* md_per_SI
+true_kz_mD = perm_true_z_SI .* md_per_SI
+function rmse(a, b)
+    return sqrt(mean((a .- b).^2))
+end
+@info @sprintf("RMSE (мД): kx=%.2f, ky=%.2f, kz=%.2f", rmse(kx_mD, true_kx_mD), rmse(ky_mD, true_ky_mD), rmse(kz_mD, true_kz_mD))
 
 # (опционально) сохраним CSV
 function save_perm_csv(path::AbstractString, kx, ky, kz, sz::NTuple{3,Int})
@@ -146,4 +166,9 @@ end
 sz = size(data["GRID"]["PERMX"])  # например (5,5,1)
 save_perm_csv("perm_lbfsg_mD.csv", kx_mD, ky_mD, kz_mD, sz)
 @info "Сохранил kx,ky,kz (мДарси) в perm_lbfsg_mD.csv"
-@info @sprintf("TUNED (мД): kx=%.1f, ky=%.1f, kz=%.1f", kx_mD[1], ky_mD[1], kz_mD[1])
+kx_mean_mD = mean(kx_mD)
+ky_mean_mD = mean(ky_mD)
+kz_mean_mD = mean(kz_mD)
+
+@info @sprintf("TUNED MEAN (мД): kx=%.1f, ky=%.1f, kz=%.1f",
+               kx_mean_mD, ky_mean_mD, kz_mean_mD)
