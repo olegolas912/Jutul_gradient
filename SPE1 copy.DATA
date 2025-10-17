@@ -92,22 +92,22 @@ PORO
 -- Constant porosity of 0.3 throughout all 300 grid cells
    	25*0.2 /
 
-PERMX --вставить свой файл с проницаемостью
+--PERMX --вставить свой файл с проницаемостью
 -- The layers have perm. 500mD, 50mD and 200mD, respectively.
-	25*500 /
+--	25*500 /
 
-PERMY --копировать с PERMX
+--PERMY --копировать с PERMX
 -- Equal to PERMX
-	25*500 /
+--	25*500 /
 
-PERMZ --копировать с PERMX / 10
+--PERMZ --копировать с PERMX / 10
 -- Cannot find perm. in z-direction in Odeh's paper
 -- For the time being, we will assume PERMZ equal to PERMX and PERMY:
-	25*50 /
+--	25*50 /
 
---INCLUDE
---  'perms_from_csv.inc'
---/
+INCLUDE
+  'perms_from_csv.inc'
+/
 
 ECHO
 

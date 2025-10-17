@@ -121,7 +121,7 @@ function save_perm_csv(path::AbstractString, kx, ky, kz, sz::NTuple{3,Int})
     end
 end
 
-sz = size(data["GRID"]["PERMX"])  # например (5,5,1)
+sz = size(data["GRID"]["PERMX"])
 save_perm_csv("perm_lbfsg_mD.csv", kx_mD, ky_mD, kz_mD, sz)
 @info "Сохранил kx,ky,kz (мДарси) в perm_lbfsg_mD.csv"
 kx_mean_mD = mean(kx_mD)
