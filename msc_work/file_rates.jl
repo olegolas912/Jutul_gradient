@@ -96,8 +96,8 @@ perm_true_y_SI = vec(data["GRID"]["PERMY"])
 perm_true_z_SI = vec(data["GRID"]["PERMZ"])
 
 # Задаём «плохой» старт в мДарси:
-kx_start_mD = 120.0   # << истина 500
-ky_start_mD = 80.0    # << истина 500
+kx_start_mD = 180.0   # << истина 500
+ky_start_mD = 180.0    # << истина 500
 kz_start_mD = 50.0    # берём true kz для стабильности
 
 # Конвертируем в СИ и заполняем все ячейки константой
